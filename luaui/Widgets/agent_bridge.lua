@@ -2,11 +2,15 @@
 -- Exposes a local HTTP server (port 7654) for external LLM/Python agent control.
 --
 -- Endpoints:
---   GET  /state        → Full game state (ally teams, units, resources, visible enemies, map info)
---   GET  /defs         → Unit definition catalog (all buildable units with categories)
---   GET  /chat         → Drain the incoming in-game chat buffer (new messages since last poll)
---   POST /chat/send    → Send a message to in-game all-chat
---   POST /command      → Issue a command to a unit (forwarded to synced relay gadget)
+--   GET  /state           → Full game state (ally teams, units, resources, visible enemies, map info)
+--   GET  /defs            → Unit definition catalog (all buildable units with categories)
+--   GET  /chat            → Drain the incoming in-game chat buffer (new messages since last poll)
+--   POST /chat/send       → Send a message to in-game all-chat
+--   POST /command         → Issue a command to a unit (forwarded to synced relay gadget)
+--   POST /tts/start       → Show TTS portrait (body: {"duration":<seconds>, "pose":"calm"|"attack"})
+--   POST /tts/stop        → Hide TTS portrait immediately
+--   POST /tts/amplitude   → Feed audio amplitude for shake effect (body: {"value":<0-1>})
+--   POST /gift            → Transfer bot units to the human player (body: {"unitIDs":[...]})
 --
 -- NOTE: JSON is self-contained (no VFS.Include dependency) — works in both
 --   the game widget dir (luaui/Widgets/) and the user widget dir (LuaUI/Widgets/).
@@ -351,6 +355,13 @@ local function buildState()
 					isBuilder    = uDef.isBuilder,
 					isFactory    = uDef.isFactory,
 					canMove      = uDef.canMove,
+					canAttack    = uDef.canAttack or false,
+					isExtractor  = ((uDef.extractsMetal or 0) > 0),
+					isGenerator  = ((uDef.windGenerator or 0) > 0
+					                 or (uDef.tidalGenerator or 0) > 0
+					                 or ((uDef.energyMake or 0) > 0
+					                     and not uDef.canMove
+					                     and not uDef.isFactory)),
 					x            = x and math.floor(x) or 0,
 					y            = y and math.floor(y) or 0,
 					z            = z and math.floor(z) or 0,
@@ -469,6 +480,43 @@ local function handleRequest(method, path, body)
 		eventsBuffer = {}
 		return jsonOk(evts)
 
+	-- POST /buildqueue  {"unitIDs": [...]}
+	-- Returns the full command queue for each requested unit or factory.
+	-- Build entries: {type="build", defName, x, y, z, tag}
+	-- Other entries: {type="command", id, params, tag}
+	elseif path == "/buildqueue" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		local unitIDs = data.unitIDs
+		if type(unitIDs) ~= "table" then return jsonError("Missing 'unitIDs' array") end
+		local result = {}
+		for _, uid in ipairs(unitIDs) do
+			local rawQ   = Spring.GetUnitCommands(uid, -1) or {}
+			local entries = {}
+			for _, qcmd in ipairs(rawQ) do
+				local entry = { id = qcmd.id, tag = qcmd.tag }
+				if qcmd.id < 0 then
+					-- Build command: id = -unitDefID
+					local defID = -qcmd.id
+					local uDef  = UnitDefs[defID]
+					entry.type    = "build"
+					entry.defName = uDef and uDef.name or ("unknown:" .. defID)
+					if qcmd.params then
+						entry.x = qcmd.params[1]
+						entry.y = qcmd.params[2]
+						entry.z = qcmd.params[3]
+					end
+				else
+					entry.type   = "command"
+					entry.params = qcmd.params
+				end
+				entries[#entries+1] = entry
+			end
+			result[#result+1] = { unitID = uid, queue = entries }
+		end
+		return jsonOk(result)
+
 	-- POST /reserve  {"unitIDs": [...]}
 	elseif path == "/reserve" and method == "POST" then
 		if not body or body == "" then return jsonError("Empty body") end
@@ -529,6 +577,63 @@ local function handleRequest(method, path, body)
 		spEcho("[AgentBridge] ping queued @ (" .. x .. "," .. z .. ") label=" .. label)
 		return jsonOk({ status = "ok", x = x, z = z, label = label })
 
+	-- POST /tts/start  {"duration":<seconds>, "pose":"calm"|"attack"}  (all fields optional)
+	elseif path == "/tts/start" and method == "POST" then
+		local duration = nil
+		local pose     = "calm"
+		if body and body ~= "" then
+			local ok, data = pcall(Json.decode, body)
+			if ok and type(data) == "table" then
+				duration = tonumber(data.duration)
+				if data.pose == "attack" then pose = "attack" end
+			end
+		end
+		if WG.TTSStart then
+			WG.TTSStart(duration, pose)
+			spEcho("[AgentBridge] TTS start (duration=" .. tostring(duration) .. "  pose=" .. pose .. ")")
+			return jsonOk({ status = "ok", duration = duration, pose = pose })
+		else
+			return jsonError("TTSDisplay widget not loaded", 503)
+		end
+
+	-- POST /tts/stop
+	elseif path == "/tts/stop" and method == "POST" then
+		if WG.TTSStop then
+			WG.TTSStop()
+			spEcho("[AgentBridge] TTS stop")
+			return jsonOk({ status = "ok" })
+		else
+			return jsonError("TTSDisplay widget not loaded", 503)
+		end
+
+	-- POST /tts/amplitude  {"value":<0.0-1.0>}
+	elseif path == "/tts/amplitude" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		local val = tonumber(data.value)
+		if val == nil then return jsonError("Missing 'value' field (number 0-1)") end
+		if WG.TTSAmplitude then
+			WG.TTSAmplitude(val)
+		end
+		return jsonOk({ status = "ok", value = val })
+
+	-- POST /gift  {"unitIDs": [...]}
+	-- Transfers listed bot units to the local human player's team.
+	elseif path == "/gift" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		local unitIDs = data.unitIDs
+		if type(unitIDs) ~= "table" or #unitIDs == 0 then
+			return jsonError("Missing or empty 'unitIDs' array")
+		end
+		local toTeamID = spGetMyTeamID()
+		local payload = { unitIDs = unitIDs, toTeamID = toTeamID }
+		spSendLuaRulesMsg("AGENTBRIDGE_GIFT:" .. Json.encode(payload))
+		spEcho("[AgentBridge] gift " .. #unitIDs .. " unit(s) to team " .. toTeamID)
+		return jsonOk({ status = "ok", toTeamID = toTeamID, count = #unitIDs })
+
 	else
 		return buildHttpResponse(404, "Not Found", Json.encode({ error = "Not found" }))
 	end
@@ -575,7 +680,11 @@ function widget:AddConsoleLine(msg, priority)
 		local clean = msg:match("^%[f=%d+%] (.+)$") or msg
 		for line in (clean .. "\n"):gmatch("([^\n]*)\n") do
 			if line ~= "" then
-				pushChat(line)
+				-- Suppress our own internal debug lines — they flood the chat buffer
+				-- and confuse the LLM agent. Player chat comes via GotChatMsg instead.
+				if line:sub(1, 13) ~= "[AgentBridge" then
+					pushChat(line)
+				end
 			end
 		end
 	end

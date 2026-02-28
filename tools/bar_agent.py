@@ -8,18 +8,24 @@ and responds with real commands via a Strands + Mistral LLM agent.
 Usage
 -----
     export MISTRAL_API_KEY="your_key_here"
+    export ELEVENLABS_API_KEY="your_key_here"   # optional, enables TTS
     python tools/bar_agent.py
 
 Optional env vars:
-    BAR_HOST  (default: 127.0.0.1)
-    BAR_PORT  (default: 7654)
-    MISTRAL_MODEL  (default: mistral-large-latest)
-    AGENT_PREFIX  – chat prefix that triggers the agent (default: @agent)
-    AGENT_PREFIX2 – alternative prefix (default: !)
+    BAR_HOST         (default: 127.0.0.1)
+    BAR_PORT         (default: 7654)
+    MISTRAL_MODEL    (default: mistral-large-latest)
+    AGENT_PREFIX     – chat prefix that triggers the agent (default: @agent)
+    AGENT_PREFIX2    – alternative prefix (default: !)
+    ELEVENLABS_API_KEY – enables TTS voice output via ElevenLabs
+    EL_VOICE_ID      – ElevenLabs voice ID (default: Adam)
+    EL_MODEL_ID      – ElevenLabs model  (default: eleven_turbo_v2_5)
+    EL_AMP_SCALE     – RMS→0-1 multiplier for shake effect (default: 5.0)
 
 Requirements
 ------------
     pip install 'strands-agents[mistral]' strands-agents-tools
+    pip install elevenlabs sounddevice numpy   # optional, for TTS
 """
 
 import json
@@ -53,6 +59,114 @@ AGENT_PREFIX = os.environ.get("AGENT_PREFIX", "@agent")
 AGENT_PREFIX2 = os.environ.get("AGENT_PREFIX2", "!")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # seconds
 
+# ElevenLabs TTS (all optional — TTS silently disabled when unset/missing)
+EL_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
+EL_MODEL_ID = os.environ.get("EL_MODEL_ID", "eleven_turbo_v2_5")
+EL_AMP_SCALE = float(os.environ.get("EL_AMP_SCALE", "5.0"))  # RMS → 0–1
+
+# ---------------------------------------------------------------------------
+# ElevenLabs TTS engine  (optional)
+# ---------------------------------------------------------------------------
+_el_client = None  # ElevenLabs client (None when unavailable)
+_tts_lock = threading.Lock()  # serialises concurrent speak() calls
+
+try:
+    from elevenlabs import ElevenLabs as _ElevenLabs
+    import numpy as _np
+    import sounddevice as _sd
+
+    if EL_API_KEY:
+        _el_client = _ElevenLabs(api_key=EL_API_KEY)
+        print(f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}")
+    else:
+        print("[tts] ELEVENLABS_API_KEY not set — TTS disabled.")
+except ImportError as _tts_import_err:
+    print(f"[tts] Optional deps missing ({_tts_import_err}) — TTS disabled.")
+    print("      pip install elevenlabs sounddevice numpy")
+
+
+def _speak(text: str, pose: str = "calm") -> None:
+    """
+    Generate TTS audio via ElevenLabs (pcm_16000) and play it through
+    sounddevice, feeding per-chunk RMS amplitude to the game UI portrait.
+    pose: "attack" or "calm" — selects which sprite the game UI displays.
+    Blocks until playback is complete.
+    """
+    if _el_client is None:
+        return
+    import re as _re
+
+    clean = _re.sub(r"[*_`#]+", "", text).strip()
+    if not clean:
+        return
+    try:
+        # Request raw PCM: s16le @ 16 kHz mono (no decoder needed)
+        # convert() may return a generator of chunks — collect them all.
+        raw = _el_client.text_to_speech.convert(
+            voice_id=EL_VOICE_ID,
+            text=clean,
+            model_id=EL_MODEL_ID,
+            output_format="pcm_16000",
+        )
+        audio_bytes: bytes = (
+            raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
+        )
+        audio_f32 = (
+            _np.frombuffer(audio_bytes, dtype=_np.int16).astype(_np.float32) / 32768.0
+        )
+        duration = len(audio_f32) / 16000.0
+
+        # Notify the game: show the portrait with the requested pose
+        try:
+            _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
+        except Exception:
+            pass
+
+        SAMPLE_RATE = 16000
+        CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
+
+        with _sd.OutputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32"
+        ) as stream:
+            for i in range(0, len(audio_f32), CHUNK):
+                chunk = audio_f32[i : i + CHUNK]
+                if len(chunk) < CHUNK:
+                    # Pad the final (possibly short) block so OutputStream is happy
+                    chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
+                stream.write(chunk)
+                rms = float(_np.sqrt(_np.mean(chunk**2)))
+                amplitude = min(1.0, rms * EL_AMP_SCALE)
+                try:
+                    _post("/tts/amplitude", {"value": amplitude})
+                except Exception:
+                    pass
+
+    except Exception as exc:
+        print(f"[tts] ERROR: {exc}")
+    finally:
+        try:
+            _post("/tts/stop", {})
+        except Exception:
+            pass
+
+
+def _speak_async(text: str, pose: str = "calm") -> None:
+    """
+    Fire-and-forget TTS in a background daemon thread.
+    Calls are serialised by _tts_lock so they never overlap.
+    pose: "attack" or "calm" — forwarded to the game UI portrait.
+    """
+    if _el_client is None:
+        return
+
+    def _run() -> None:
+        with _tts_lock:
+            _speak(text, pose=pose)
+
+    threading.Thread(target=_run, daemon=True, name="tts").start()
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -72,7 +186,9 @@ def _http(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            return json.loads(
+                resp.read().decode("utf-8", errors="replace"), strict=False
+            )
     except urllib.error.HTTPError as e:
         # Server responded with an HTTP error code (e.g. 404 = unknown endpoint)
         body_txt = e.read().decode(errors="replace")
@@ -154,26 +270,33 @@ def get_new_chat_messages() -> str:
 
 
 @tool
-def send_chat_message(message: str) -> str:
+def send_chat_message(message: str, pose: str = "calm") -> str:
     """
-    Sends a chat message visible to all players in-game.
+    Sends a chat message visible to all players in-game and speaks it via TTS.
     Use this to acknowledge commands, give status updates, or communicate
     with teammates.
 
     Args:
         message: The text to broadcast in the in-game 'All' chat channel.
+        pose:    Which commander portrait to show during TTS playback.
+                 Use "attack" when delivering aggressive orders, warnings, or
+                 battle reports (e.g. enemy spotted, launching attack).
+                 Use "calm" (default) for routine status updates, confirmations,
+                 or strategic advice.
     """
     try:
-        # Split messages longer than 250 chars into multiple sends
+        # Split messages longer than 250 chars into multiple in-game sends
         results = []
         parts = [message[i : i + 250] for i in range(0, len(message), 250)]
         for part in parts:
             resp = _post("/chat/send", {"message": part})
             results.append(resp)
             print(f"[send_chat] sent: {part!r} → {resp}")
+        # Speak the full message with the chosen portrait pose
+        _speak_async(message, pose=pose)
         return json.dumps(results if len(results) > 1 else results[0])
-    except (ConnectionError, RuntimeError) as e:
-        print(f"[send_chat] ERROR: {e}")
+    except Exception as e:
+        print(f"\n[send_chat] ERROR ({type(e).__name__}): {e}")
         return f"ERROR: {e}"
 
 
@@ -313,35 +436,66 @@ def find_allied_units(
     Returns a filtered list of allied units from the current game state.
 
     Args:
-        category:    Filter by unit category. Examples: 'factory', 'constructor',
-                     'extractor', 'commander', 'generator'. Empty = all categories.
-        name_filter: Filter by defName substring, e.g. 'arm_'. Empty = all.
-        owner:       Who owns the units to include:
-                     'bot'    – only AI/bot teams (DEFAULT — use this normally)
-                     'human'  – only the human player's own units
-                     'all'    – all allied units regardless of owner
+        category:    Filter by unit category. Supported values:
+                     'commander'   – the commander unit (isCommander)
+                     'factory'     – unit-producing buildings (isFactory)
+                     'constructor' – mobile builder units, NOT factories or commanders
+                                     (isBuilder AND canMove AND NOT isFactory AND NOT isCommander)
+                     'builder'     – all builders incl. commander (isBuilder AND NOT isFactory)
+                     'combat'      – mobile fighting units (canMove AND canAttack AND NOT isBuilder)
+                     'defense'     – static weapons/turrets (NOT canMove AND canAttack)
+                     'extractor'   – metal extractors (isExtractor)
+                     'generator'   – energy producers: solar, wind, tidal (isGenerator)
+                     'structure'   – other static non-combat buildings
+                     ''            – return all units (no filter)
+        name_filter: Filter by defName substring, e.g. 'arm'. Empty = all.
+        owner:       'bot' (default) – AI teams only
+                     'human'        – human player's units only
+                     'all'          – all allied units
 
-    IMPORTANT: Default is 'bot'. Always use owner='bot' unless the player
-    explicitly asks you to command their own units.
+    IMPORTANT: Always use owner='bot' unless the player explicitly asks you
+    to command their own units.
 
-    Returns a JSON list of unit objects: {unitID, name, humanName, isCommander,
-    isFactory, canMove, x, y, z, health, maxHealth, buildOptions, teamID, isBot}
+    Returns a JSON list: [{unitID, name, humanName, isCommander, isFactory,
+    isBuilder, canMove, canAttack, isExtractor, isGenerator, x, y, z,
+    health, maxHealth, buildOptions, teamID, isBot}, ...]
     """
     try:
         state = _get("/state")
     except ConnectionError as e:
         return f"ERROR: {e}"
 
-    # Map human-friendly category names to the actual JSON field/value
-    FLAG_MAP = {
-        "commander":   "isCommander",
-        "factory":     "isFactory",
-        "constructor": "isBuilder",
-        "builder":     "isBuilder",
-    }
+    def _matches_category(unit: dict, cat: str) -> bool:
+        is_cmd = unit.get("isCommander", False)
+        is_fact = unit.get("isFactory", False)
+        is_bld = unit.get("isBuilder", False)
+        can_mv = unit.get("canMove", False)
+        can_atk = unit.get("canAttack", False)
+        is_ext = unit.get("isExtractor", False)
+        is_gen = unit.get("isGenerator", False)
+        if cat == "commander":
+            return is_cmd
+        if cat == "factory":
+            return is_fact
+        if cat == "constructor":
+            return is_bld and can_mv and not is_fact and not is_cmd
+        if cat == "builder":
+            return is_bld and not is_fact
+        if cat == "combat":
+            return can_mv and can_atk and not is_bld
+        if cat == "defense":
+            return not can_mv and can_atk
+        if cat == "extractor":
+            return is_ext
+        if cat == "generator":
+            return is_gen
+        if cat == "structure":
+            return (
+                not can_mv and not can_atk and not is_fact and not is_ext and not is_gen
+            )
+        return False  # unknown category
 
     result = []
-    # State returns 'teams' (all ally teams), each with isBot and isMyTeam flags
     for team in state.get("teams", []):
         is_bot = team.get("isBot", False)
         is_my_team = team.get("isMyTeam", False)
@@ -350,18 +504,8 @@ def find_allied_units(
         if owner == "human" and not is_my_team:
             continue
         for unit in team.get("units", []):
-            # ── Category filter ──
-            if category:
-                cat_lower = category.lower()
-                flag_key = FLAG_MAP.get(cat_lower)
-                if flag_key:
-                    # Use the boolean flag (isFactory, isBuilder, isCommander)
-                    if not unit.get(flag_key):
-                        continue
-                else:
-                    # Fallback: try matching a direct field or substring in name
-                    if not unit.get(cat_lower, False):
-                        continue
+            if category and not _matches_category(unit, category.lower()):
+                continue
             if name_filter and name_filter.lower() not in unit.get("name", "").lower():
                 continue
             result.append({**unit, "teamID": team["teamID"], "isBot": is_bot})
@@ -605,6 +749,66 @@ def reserve_and_build(
 
 
 @tool
+def get_build_queue(unit_ids: list) -> str:
+    """
+    Returns the current command queue for one or more units or factories.
+
+    Each entry is one of:
+    - Build order:    {"type": "build",   "defName": "<name>", "x": <n>, "z": <n>, "tag": <n>}
+    - Other command:  {"type": "command", "id": <n>, "params": [...],    "tag": <n>}
+
+    An empty "queue" list means the unit is idle (no pending orders).
+
+    Use this to:
+    - Confirm a factory or constructor is still executing a build order you issued.
+    - Count how many items remain in a factory's production backlog.
+    - Check whether a builder has an empty queue before assigning it a new task.
+    - Diagnose why a build task continuation has not fired yet (unit may have
+      been given other orders or the build may have already finished).
+
+    Args:
+        unit_ids: List of integer Spring unit IDs (factories, constructors, etc.)
+    """
+    try:
+        result = _post("/buildqueue", {"unitIDs": unit_ids})
+        print(f"[buildqueue] {result}")
+        return json.dumps(result)
+    except (ConnectionError, RuntimeError) as e:
+        print(f"[buildqueue] ERROR: {e}")
+        return f"ERROR: {e}"
+
+
+@tool
+def gift_units(unit_ids: list) -> str:
+    """
+    Transfers one or more bot-owned units or structures to the human player.
+    Use this to hand over units you have built or controlled — the player
+    will receive direct control of them immediately.
+
+    Typical uses:
+    - Give a freshly built constructor or combat unit to the player so they
+      can micro it themselves.
+    - Hand over a building (factory, defense turret, etc.) to let the player
+      manage its production queue.
+    - Reward the player with units after completing an objective.
+
+    IMPORTANT: only gift bot-owned units (isBot=true). Gifting units that
+    already belong to the human player has no effect and wastes a tool call.
+    Always unreserve the units BEFORE gifting them so the transfer succeeds.
+
+    Args:
+        unit_ids: List of integer Spring unit IDs to transfer to the player.
+    """
+    try:
+        resp = _post("/gift", {"unitIDs": unit_ids})
+        print(f"[gift] {unit_ids} → {resp}")
+        return json.dumps(resp)
+    except (ConnectionError, RuntimeError) as e:
+        print(f"[gift] ERROR: {e}")
+        return f"ERROR: {e}"
+
+
+@tool
 def get_pending_events() -> str:
     """
     Poll and drain all pending unit events (idle, finished, destroyed,
@@ -669,8 +873,15 @@ Your role:
 - When building units in a factory, use the exact defName from get_build_catalog.
 - When the player says "build X", ALWAYS issue the build order, even if X already
   exists on the map. The player wants ANOTHER one built unless they say otherwise.
-- Always obey the player's commands as literally as possible. If they say to attack an allied unit or something that seems suboptimal, just do it and don't question it. The player is the commander, you are the co-commander.,
+- Always obey the player's commands as literally as possible. If they say to attack an allied unit or something that seems suboptimal,
+  just do it and don't question it. The player is the commander, you are the co-commander.,
 - Address the player like a military subordinate, e.g. "Yes, Commander. Building additional metal extractor at (x, z)."
+- When you start thinking, the player will have been waiting alread for a couple of seconds, 
+  so respond as quickly as possible before starting your actions, then do the rest of your
+  thinking and planning while the first message is in transit.  You can send multiple messages
+  in a row if needed to acknowledge the command, then give updates as you execute it.
+- I repeat, ALWAYS use send_chat_message() to talk to the player. Do NOT expect any text response you 
+  generate to be seen by the player, those are only for your thinking out loud.
 
 CRITICAL — which units to command:
 - The game state contains teams with two flags: isBot (AI team) and isMyTeam (human player).
@@ -704,6 +915,12 @@ Multi-step tasks with unit reservation:
 - Use a descriptive task_id slug (e.g. "build_bot_lab", "produce_5_tanks"). Keep it
   short and unique per concurrent task.
 - Do NOT re-explain the task in the continuation — just execute the next step.
+- When a TASK CONTINUATION fires with an "idle" event, ALWAYS call get_build_queue([unit_id])
+  first to confirm the queue is empty and the build is truly done before calling
+  unreserve_units() or unwatch_unit(). A non-empty queue means the unit is still working.
+- You can gift bot units to the player with gift_units(). Do so when the player asks for
+  units, when a build task is complete and the player should receive the result, or as a
+  tactical gesture. Always unreserve_units() before calling gift_units().
 """
 
 BAR_TOOLS = [
@@ -722,6 +939,8 @@ BAR_TOOLS = [
     get_pending_events,
     reserve_and_build,
     map_ping,
+    gift_units,
+    get_build_queue,
 ]
 
 
@@ -741,7 +960,8 @@ def build_agent() -> Agent:
             tu = kwargs["current_tool_use"]
             name = tu.get("name", "?")
             inp = tu.get("input", {})
-            print(f"[tool_call] {name}({inp})")
+            # Print on its own line even if a streaming chunk left no newline
+            print(f"\n[tool_call] {name}({inp})")
         # Also stream text chunks to stdout so we can follow reasoning
         elif "data" in kwargs and isinstance(kwargs["data"], str):
             print(kwargs["data"], end="", flush=True)
@@ -894,12 +1114,15 @@ def run_chat_loop(agent: Agent) -> None:
 
         for entry in messages:
             text = entry.get("text", "")
-            print(f"[poll] {text!r}")
-            if not _should_route(text):
+            # Skip internal debug lines that leak through the console capture
+            if text.startswith("[AgentBridge"):
                 continue
-            user_input = _strip_prefix(text)
-            print(f"[→ agent] routing: {user_input!r}")
-            _enqueue(user_input, task_id=None, priority=0)
+            if _should_route(text):
+                user_input = _strip_prefix(text)
+                print(f"[→ agent] routing: {user_input!r}")
+                _enqueue(user_input, task_id=None, priority=0)
+            else:
+                print(f"[poll] {text!r}")
 
         # ── 2. Process pending unit events ──────────────────────────────────
         try:

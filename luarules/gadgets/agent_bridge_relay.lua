@@ -9,6 +9,7 @@
 --   "AGENTBRIDGE_UNRESERVE:<json>" – { "unitIDs": [...] }
 --   "AGENTBRIDGE_WATCH:<json>"     – { "unitID": <n>, "event": "idle"|"finished"|"destroyed"|"from_factory"|"any", "taskID": "<str>" }
 --                                    add "unwatch": true to stop watching
+--   "AGENTBRIDGE_GIFT:<json>"      – { "unitIDs": [...], "toTeamID": <n> }
 --
 -- Synced callins: AllowCommand, UnitIdle, UnitFinished, UnitDestroyed, UnitFromFactory
 -- Events flow: synced gadget → SendToUnsynced (global) → gadget:agentEvent (unsynced)
@@ -79,6 +80,8 @@ local MSG_UNRESERVE       = "AGENTBRIDGE_UNRESERVE:"
 local MSG_UNRESERVE_LEN   = #MSG_UNRESERVE
 local MSG_WATCH           = "AGENTBRIDGE_WATCH:"
 local MSG_WATCH_LEN       = #MSG_WATCH
+local MSG_GIFT            = "AGENTBRIDGE_GIFT:"
+local MSG_GIFT_LEN        = #MSG_GIFT
 
 --------------------------------------------------------------------------------
 -- Spring API locals
@@ -128,6 +131,9 @@ local function buildAllyTeamSets()
 			allyTeamSets[allyTeamID][teamID] = true
 		end
 	end
+	local nTeams = allTeams and #allTeams or 0
+	local nSets  = 0; for _ in pairs(allyTeamSets) do nSets = nSets + 1 end
+	spEcho("[AgentBridgeRelay] buildAllyTeamSets: " .. nTeams .. " teams → " .. nSets .. " allyTeam groups")
 end
 
 function gadget:GameStart()
@@ -152,14 +158,33 @@ end
 -- fromLua=true + _agentOrderInProgress=true  →  OUR order → allow.
 -- fromLua=true + reserved + NOT our order    →  block native AI.
 -- fromLua=false (human click)                →  always allow (player override).
+--
+-- BAR AllowCommand signature (10 args):
+--   unitID, unitDefID, teamID, cmdID, cmdParams, cmdOptions,
+--   cmdTag, playerID, fromSynced, fromLua
 --------------------------------------------------------------------------------
 function gadget:AllowCommand(unitID, unitDefID, unitTeam,
                               cmdID, cmdParams, cmdOptions,
-                              cmdTag, synced, fromLua)
-	if reservedUnits[unitID] and fromLua and not _agentOrderInProgress then
-		return false  -- native AI trying to order a reserved unit — block it
+                              cmdTag, playerID, fromSynced, fromLua)
+	if not reservedUnits[unitID] then return true end
+
+	-- Our own agent order: always allow
+	if _agentOrderInProgress then return true end
+
+	-- Human player direct click (fromLua=false AND fromSynced=false): allow override
+	if not fromLua and not fromSynced then
+		spEcho("[AgentBridgeRelay] AllowCommand: player override on reserved unit "
+			.. unitID .. " cmdID=" .. tostring(cmdID) .. " — ALLOWED")
+		return true
 	end
-	return true
+
+	-- Everything else (LuaAI, C++ AI, other gadgets): block
+	spEcho("[AgentBridgeRelay] AllowCommand: BLOCKED on reserved unit "
+		.. unitID .. " cmdID=" .. tostring(cmdID)
+		.. " fromLua=" .. tostring(fromLua)
+		.. " fromSynced=" .. tostring(fromSynced)
+		.. " playerID=" .. tostring(playerID))
+	return false
 end
 
 --------------------------------------------------------------------------------
@@ -186,6 +211,15 @@ end
 function gadget:UnitIdle(unitID, unitDefID, unitTeam)
 	local w = watchedUnits[unitID]
 	if w and (w.event == "idle" or w.event == "any") then
+		-- Spring sometimes fires UnitIdle for one frame when GiveOrderToUnit
+		-- replaces the command queue (old queue cleared → new order not yet queued).
+		-- Guard against this by only firing if the queue is truly empty.
+		local q = Spring.GetUnitCommands(unitID, 1)
+		if q and #q > 0 then
+			spEcho("[AgentBridgeRelay] UnitIdle: unit " .. unitID
+				.. " has " .. #q .. " cmd(s) still queued — suppressing spurious idle")
+			return
+		end
 		pushEvent({ type = "idle", unitID = unitID, taskID = w.taskID })
 	end
 end
@@ -270,6 +304,9 @@ local function dispatchCommand(senderTeamID, cmd)
 		return
 	end
 
+	spEcho("[AgentBridgeRelay] dispatchCommand: unitID=" .. unitID
+		.. " verb=" .. verb .. " senderTeam=" .. tostring(senderTeamID))
+
 	local targetTeamID = spGetUnitTeam(unitID)
 	if not targetTeamID then
 		spEcho("[AgentBridgeRelay] Unknown unitID: " .. unitID)
@@ -278,8 +315,10 @@ local function dispatchCommand(senderTeamID, cmd)
 
 	-- Security: only allow control of units in the same alliance as the sender
 	if senderTeamID and not sameAllyTeam(senderTeamID, targetTeamID) then
+		local nSets = 0; for _ in pairs(allyTeamSets) do nSets = nSets + 1 end
 		spEcho("[AgentBridgeRelay] Blocked: sender team " .. senderTeamID ..
-			" tried to control enemy team " .. targetTeamID)
+			" tried to control enemy team " .. targetTeamID ..
+			" (allyTeamSets count=" .. nSets .. ")")
 		return
 	end
 
@@ -301,11 +340,15 @@ local function dispatchCommand(senderTeamID, cmd)
 		if not x then x, y, z = spGetUnitPosition(unitID) end
 		if x and z then y = spGetGroundHeight(x, z) end
 		local facing = cmd.facing or 0
-		-- opts=0 already replaces the full command queue — no need for a prior
-		-- CMD.STOP, which would cause a spurious UnitIdle event and wake event
-		-- watchers before the build has actually started.
+		spEcho("[AgentBridgeRelay] build ISSUING order: unit=" .. unitID
+			.. " type=" .. tostring(cmd.unitType)
+			.. " defID=" .. tostring(buildDefID)
+			.. " pos=(" .. tostring(x) .. "," .. tostring(y) .. "," .. tostring(z) .. ")"
+			.. " facing=" .. tostring(facing))
+		-- opts=0 replaces the full queue (no prior CMD.STOP needed, which would
+		-- cause a spurious UnitIdle event before the build actually starts).
 		spGiveOrderToUnit(unitID, -buildDefID, { x or 0, y or 0, z or 0, facing }, 0)
-		spEcho("[AgentBridgeRelay] build " .. tostring(cmd.unitType) ..
+		spEcho("[AgentBridgeRelay] build order accepted: " .. tostring(cmd.unitType) ..
 			" @ (" .. tostring(x) .. "," .. tostring(y) .. "," .. tostring(z) ..
 			") facing=" .. tostring(facing))
 		_agentOrderInProgress = false
@@ -343,13 +386,19 @@ end
 --------------------------------------------------------------------------------
 local function handleReserve(cmd)
 	for _, uid in ipairs(cmd.unitIDs or {}) do
-		if type(uid) == "number" then reservedUnits[uid] = true end
+		if type(uid) == "number" then
+			reservedUnits[uid] = true
+			spEcho("[AgentBridgeRelay] reserved unit " .. uid)
+		end
 	end
 end
 
 local function handleUnreserve(cmd)
 	for _, uid in ipairs(cmd.unitIDs or {}) do
-		if type(uid) == "number" then reservedUnits[uid] = nil end
+		if type(uid) == "number" then
+			reservedUnits[uid] = nil
+			spEcho("[AgentBridgeRelay] unreserved unit " .. uid)
+		end
 	end
 end
 
@@ -369,6 +418,34 @@ local function handleUnwatch(cmd)
 	if type(uid) == "number" then watchedUnits[uid] = nil end
 end
 
+local function handleGift(cmd, senderTeamID)
+	spEcho("[AgentBridgeRelay] gift: received cmd, senderTeamID=" .. tostring(senderTeamID))
+	local toTeamID = cmd.toTeamID
+	spEcho("[AgentBridgeRelay] gift: toTeamID=" .. tostring(toTeamID) .. " unitIDs count=" .. tostring(#(cmd.unitIDs or {})))
+	if type(toTeamID) ~= "number" then
+		spEcho("[AgentBridgeRelay] gift: ERROR missing or non-numeric toTeamID")
+		return
+	end
+	for _, uid in ipairs(cmd.unitIDs or {}) do
+		if type(uid) == "number" then
+			local ownerTeam = spGetUnitTeam(uid)
+			spEcho("[AgentBridgeRelay] gift: uid=" .. uid .. " ownerTeam=" .. tostring(ownerTeam))
+			if not ownerTeam then
+				spEcho("[AgentBridgeRelay] gift: ERROR unknown unitID " .. uid)
+			elseif senderTeamID and not sameAllyTeam(senderTeamID, ownerTeam) then
+				spEcho("[AgentBridgeRelay] gift: ERROR blocked unit " .. uid .. " ownerTeam=" .. ownerTeam .. " senderTeam=" .. senderTeamID)
+			else
+				local ok = Spring.TransferUnit(uid, toTeamID, true)
+				reservedUnits[uid] = nil
+				watchedUnits[uid]  = nil
+				spEcho("[AgentBridgeRelay] gift: TransferUnit(" .. uid .. ", " .. toTeamID .. ", true) returned " .. tostring(ok))
+			end
+		else
+			spEcho("[AgentBridgeRelay] gift: skipping non-numeric uid=" .. tostring(uid))
+		end
+	end
+end
+
 --------------------------------------------------------------------------------
 -- Message receiver
 --------------------------------------------------------------------------------
@@ -380,6 +457,18 @@ function gadget:RecvLuaMsg(msg, playerID)
 		local _, _, _, teamID = Spring.GetPlayerInfo(playerID, false)
 		senderTeamID = teamID
 	end
+
+	-- Silently ignore messages from other gadgets/systems that don't use our prefixes
+	local isOurs = (
+		msg:sub(1, MSG_PREFIX_LEN)    == MSG_PREFIX    or
+		msg:sub(1, MSG_RESERVE_LEN)   == MSG_RESERVE   or
+		msg:sub(1, MSG_UNRESERVE_LEN) == MSG_UNRESERVE or
+		msg:sub(1, MSG_WATCH_LEN)     == MSG_WATCH     or
+		msg:sub(1, MSG_GIFT_LEN)      == MSG_GIFT
+	)
+	if not isOurs then return end
+
+	spEcho("[AgentBridgeRelay] RecvLuaMsg len=" .. #msg .. " playerID=" .. tostring(playerID) .. " senderTeam=" .. tostring(senderTeamID) .. " prefix=" .. msg:sub(1, 20))
 
 	-- ── Unit order ─────────────────────────────────────────────────────────────
 	if msg:sub(1, MSG_PREFIX_LEN) == MSG_PREFIX then
@@ -412,6 +501,16 @@ function gadget:RecvLuaMsg(msg, playerID)
 		local ok, cmd = pcall(Json.decode, msg:sub(MSG_WATCH_LEN + 1))
 		if ok and type(cmd) == "table" then
 			if cmd.unwatch then handleUnwatch(cmd) else handleWatch(cmd) end
+		end
+		return
+	end
+	-- ── Gift units to ally ─────────────────────────────────────────────────────────────
+	if msg:sub(1, MSG_GIFT_LEN) == MSG_GIFT then
+		local ok, cmd = pcall(Json.decode, msg:sub(MSG_GIFT_LEN + 1))
+		if ok and type(cmd) == "table" then
+			handleGift(cmd, senderTeamID)
+		else
+			spEcho("[AgentBridgeRelay] gift: JSON parse failed ok=" .. tostring(ok) .. " type=" .. type(cmd))
 		end
 		return
 	end
