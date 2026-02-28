@@ -166,7 +166,7 @@ def send_chat_message(message: str) -> str:
     try:
         # Split messages longer than 250 chars into multiple sends
         results = []
-        parts = [message[i:i+250] for i in range(0, len(message), 250)]
+        parts = [message[i : i + 250] for i in range(0, len(message), 250)]
         for part in parts:
             resp = _post("/chat/send", {"message": part})
             results.append(resp)
@@ -552,9 +552,13 @@ def reserve_and_build(
                     f"Use one of those names instead."
                 )
         else:
-            print(f"[reserve_and_build] WARNING: unit {unit_id} not found in state, skipping validation")
+            print(
+                f"[reserve_and_build] WARNING: unit {unit_id} not found in state, skipping validation"
+            )
     except Exception as e:
-        print(f"[reserve_and_build] WARNING: validation failed ({e}), proceeding anyway")
+        print(
+            f"[reserve_and_build] WARNING: validation failed ({e}), proceeding anyway"
+        )
     # ──────────────────────────────────────────────────────────────────────────
     steps = []
     try:
@@ -659,6 +663,8 @@ Your role:
 - When building units in a factory, use the exact defName from get_build_catalog.
 - When the player says "build X", ALWAYS issue the build order, even if X already
   exists on the map. The player wants ANOTHER one built unless they say otherwise.
+- Always obey the player's commands as literally as possible. If they say to attack an allied unit or something that seems suboptimal, just do it and don't question it. The player is the commander, you are the co-commander.,
+- Address the player like a military subordinate, e.g. "Yes, Commander. Building additional metal extractor at (x, z)."
 
 CRITICAL — which units to command:
 - The game state contains teams with two flags: isBot (AI team) and isMyTeam (human player).
@@ -819,13 +825,17 @@ def run_chat_loop(agent: Agent) -> None:
                     return
                 _queued_tasks.add(task_id)
         _work_queue.put((priority, _next_seq(), inp, task_id))
-        print(f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}")
+        print(
+            f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}"
+        )
 
     def _worker() -> None:
         while True:
             priority, seq, inp, task_id = _work_queue.get()
             try:
-                print(f"[agent] calling LLM (priority={priority} task={task_id!r}): {inp[:120]!r}")
+                print(
+                    f"[agent] calling LLM (priority={priority} task={task_id!r}): {inp[:120]!r}"
+                )
                 last_exc = None
                 for attempt in range(2):
                     try:
@@ -833,7 +843,9 @@ def run_chat_loop(agent: Agent) -> None:
                         break
                     except TypeError as e:
                         if "concatenate str" in str(e) and attempt == 0:
-                            print(f"[agent] Strands streaming glitch, retrying... ({e})")
+                            print(
+                                f"[agent] Strands streaming glitch, retrying... ({e})"
+                            )
                             last_exc = e
                             time.sleep(1.0)
                             continue
