@@ -317,7 +317,9 @@ local function buildState()
 	local teams = {}
 	for _, teamID in ipairs(allyTeamIDs) do
 		local luaAI = spGetTeamLuaAI(teamID)
-		local isBot = (luaAI ~= nil and luaAI ~= "")
+		local _, _, _, isAITeam = Spring.GetTeamInfo(teamID, false)
+		-- Detect AI teams: either a Lua AI or any AI (C++ Skirmish, etc.)
+		local isBot = isAITeam or (luaAI ~= nil and luaAI ~= "")
 
 		local metal, metalStorage, _, metalIncome, metalExpense =
 			spGetTeamResources(teamID, "metal")

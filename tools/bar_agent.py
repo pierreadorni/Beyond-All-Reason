@@ -332,6 +332,14 @@ def find_allied_units(
     except ConnectionError as e:
         return f"ERROR: {e}"
 
+    # Map human-friendly category names to the actual JSON field/value
+    FLAG_MAP = {
+        "commander":   "isCommander",
+        "factory":     "isFactory",
+        "constructor": "isBuilder",
+        "builder":     "isBuilder",
+    }
+
     result = []
     # State returns 'teams' (all ally teams), each with isBot and isMyTeam flags
     for team in state.get("teams", []):
@@ -342,20 +350,18 @@ def find_allied_units(
         if owner == "human" and not is_my_team:
             continue
         for unit in team.get("units", []):
-            if (
-                category
-                and not unit.get(category.lower(), False)
-                and unit.get("category", "").lower() != category.lower()
-            ):
-                # Try matching isCommander, isFactory, canMove flags too
-                flag_map = {
-                    "commander": "isCommander",
-                    "factory": "isFactory",
-                    "constructor": "isBuilder",
-                }
-                flag = flag_map.get(category.lower())
-                if not (flag and unit.get(flag)):
-                    continue
+            # ── Category filter ──
+            if category:
+                cat_lower = category.lower()
+                flag_key = FLAG_MAP.get(cat_lower)
+                if flag_key:
+                    # Use the boolean flag (isFactory, isBuilder, isCommander)
+                    if not unit.get(flag_key):
+                        continue
+                else:
+                    # Fallback: try matching a direct field or substring in name
+                    if not unit.get(cat_lower, False):
+                        continue
             if name_filter and name_filter.lower() not in unit.get("name", "").lower():
                 continue
             result.append({**unit, "teamID": team["teamID"], "isBot": is_bot})
