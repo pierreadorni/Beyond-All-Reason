@@ -27,6 +27,7 @@ function widget:GetInfo()
 		license = "GNU GPL, v2 or later",
 		layer   = 0,
 		enabled = false,
+		handler = true,
 	}
 end
 
@@ -209,9 +210,13 @@ local MSG_PREFIX = "AGENTBRIDGE:"
 --------------------------------------------------------------------------------
 local server              = nil
 local clients             = {}
-local chatBuffer          = {}   -- incoming: { text, frame }
+local chatBuffer          = {}   -- incoming: { text, frame }  (drained by GET /chat)
 local peekBuffer          = {}   -- last 20 messages ever pushed (never drained)
 local outgoingChat        = {}   -- queued messages to send as in-game chat
+local eventsBuffer        = {}   -- unit events from gadget (drained by GET /events)
+local pendingPings        = {}   -- map markers queued for Spring.MarkerAddPoint (flushed in widget:Update)
+local EVT_PREFIX          = "AGENTBRIDGE_EVT:"
+local EVT_PREFIX_LEN      = #EVT_PREFIX
 local defsCatalog         = nil  -- built once on Initialize
 local _inAddConsoleLine   = false
 local _debugStats         = { addConsoleLineCalls = 0, gotChatMsgCalls = 0, pushChatCalls = 0 }
@@ -326,9 +331,9 @@ local function buildState()
 				local uDef = UnitDefs[defID]
 				local x, y, z = spGetUnitPosition(unitID)
 				local hp, maxHp = spGetUnitHealth(unitID)
-				-- Collect build options for factories
+				-- Collect build options for factories AND builders/commanders
 				local buildOpts = nil
-				if uDef.isFactory and #uDef.buildOptions > 0 then
+				if #uDef.buildOptions > 0 then
 					buildOpts = {}
 					for _, oid in ipairs(uDef.buildOptions) do
 						local od = UnitDefs[oid]
@@ -456,6 +461,36 @@ local function handleRequest(method, path, body)
 		chatBuffer  = {}
 		return jsonOk(msgs)
 
+	-- GET /events  (drain unit-event buffer, filled by gadget via WG)
+	elseif path == "/events" and method == "GET" then
+		local evts = eventsBuffer
+		eventsBuffer = {}
+		return jsonOk(evts)
+
+	-- POST /reserve  {"unitIDs": [...]}
+	elseif path == "/reserve" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		spSendLuaRulesMsg("AGENTBRIDGE_RESERVE:" .. body)
+		return jsonOk({ status = "ok" })
+
+	-- POST /unreserve  {"unitIDs": [...]}
+	elseif path == "/unreserve" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		spSendLuaRulesMsg("AGENTBRIDGE_UNRESERVE:" .. body)
+		return jsonOk({ status = "ok" })
+
+	-- POST /watch  {"unitID": n, "event": "...", "taskID": "..."[, "unwatch": true]}
+	elseif path == "/watch" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		spSendLuaRulesMsg("AGENTBRIDGE_WATCH:" .. body)
+		return jsonOk({ status = "ok" })
+
 	-- POST /chat/send
 	elseif path == "/chat/send" and method == "POST" then
 		if not body or body == "" then return jsonError("Empty body") end
@@ -478,6 +513,19 @@ local function handleRequest(method, path, body)
 		end
 		spSendLuaRulesMsg(MSG_PREFIX .. body)
 		return jsonOk({ status = "queued", unitID = cmd.unitID, cmd = cmd.cmd })
+
+	-- POST /ping  {"x":<n>, "z":<n>, "label":"<text>"}
+	elseif path == "/ping" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		local x     = tonumber(data.x) or 0
+		local z     = tonumber(data.z) or 0
+		local label = tostring(data.label or "")
+		-- Buffer the ping so MarkerAddPoint is called from widget:Update (safe callin)
+		pendingPings[#pendingPings + 1] = { x = x, z = z, label = label }
+		spEcho("[AgentBridge] ping queued @ (" .. x .. "," .. z .. ") label=" .. label)
+		return jsonOk({ status = "ok", x = x, z = z, label = label })
 
 	else
 		return buildHttpResponse(404, "Not Found", Json.encode({ error = "Not found" }))
@@ -576,8 +624,29 @@ function widget:Shutdown()
 	spEcho("[AgentBridge] Server stopped.")
 end
 
+--------------------------------------------------------------------------------
+-- Receive unit events forwarded from the unsynced LuaRules gadget
+--------------------------------------------------------------------------------
+function widget:RecvLuaMsg(msg, playerID)
+	if msg:sub(1, EVT_PREFIX_LEN) ~= EVT_PREFIX then return end
+	local jsonStr = msg:sub(EVT_PREFIX_LEN + 1)
+	local ok, decoded = pcall(jsonDecode, jsonStr)
+	if ok and type(decoded) == "table" then
+		eventsBuffer[#eventsBuffer + 1] = decoded
+		spEcho("[AgentBridge] event received: " .. jsonStr)
+	end
+end
+
 function widget:Update(dt)
 	if not server then return end
+
+	-- 0. Flush pending map markers (must be called from a standard callin)
+	for _, p in ipairs(pendingPings) do
+		local y = Spring.GetGroundHeight(p.x, p.z) or 0
+		Spring.MarkerAddPoint(p.x, y, p.z, p.label, true)  -- true = local-only, immediate display
+		spEcho("[AgentBridge] MarkerAddPoint @ (" .. p.x .. "," .. p.z .. ") label=" .. p.label)
+	end
+	pendingPings = {}
 
 	-- 1. Flush outgoing chat
 	for _, msg in ipairs(outgoingChat) do
