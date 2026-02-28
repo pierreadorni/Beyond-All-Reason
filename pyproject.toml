@@ -1,0 +1,14 @@
+[project]
+name = "bar-sdd"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai[realtime]>=1.12.4",
+    "numpy>=2.4.2",
+    "requests>=2.32.5",
+    "sounddevice>=0.5.5",
+    "strands-agents-tools>=0.2.21",
+    "strands-agents[mistral]>=1.28.0",
+]
