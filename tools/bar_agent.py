@@ -21,11 +21,18 @@ Optional env vars:
     EL_VOICE_ID      – ElevenLabs voice ID (default: Adam)
     EL_MODEL_ID      – ElevenLabs model  (default: eleven_turbo_v2_5)
     EL_AMP_SCALE     – RMS→0-1 multiplier for shake effect (default: 5.0)
+    TTS_SFX_PATH     – background crackle path (default: sounds/voice-soundeffects/AMBSci-Soft,...)
+    TTS_PREFIX_PATH  – prefix beep path (default: sounds/voice-soundeffects/prefix_communication_sound.mp3)
+    TTS_SUFFIX_PATH  – suffix sound path (default: sounds/voice-soundeffects/suffix_transmission.mp3)
+    TTS_SFX_VOLUME_DB    – crackle gain in dB (default: 10)
+    TTS_PREFIX_VOLUME_DB – prefix gain in dB (default: 0)
+    TTS_SUFFIX_VOLUME_DB – suffix gain in dB (default: 0)
 
 Requirements
 ------------
     pip install 'strands-agents[mistral]' strands-agents-tools
     pip install elevenlabs sounddevice numpy   # optional, for TTS
+    pip install pydub                          # optional, for SFX overlay
 """
 
 import asyncio
@@ -103,9 +110,26 @@ except Exception:
 
 # ElevenLabs TTS (all optional — TTS silently disabled when unset/missing)
 EL_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
-EL_MODEL_ID = os.environ.get("EL_MODEL_ID", "eleven_turbo_v2_5")
+EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "HhHF7uHMEx2kpTutnYTv")  # Adam
+EL_MODEL_ID = os.environ.get("EL_MODEL_ID", "eleven_v3")
 EL_AMP_SCALE = float(os.environ.get("EL_AMP_SCALE", "5.0"))  # RMS → 0–1
+# Sound-effect overlay paths for TTS (pydub required; set to empty string to disable)
+_BAR_ROOT = _SCRIPT_DIR.parent
+TTS_SFX_PATH = os.environ.get(
+    "TTS_SFX_PATH",
+    str(_BAR_ROOT / "sounds/voice-soundeffects/AMBSci-Soft,_crackling_old_-Elevenlabs.mp3"),
+)
+TTS_PREFIX_PATH = os.environ.get(
+    "TTS_PREFIX_PATH",
+    str(_BAR_ROOT / "sounds/voice-soundeffects/prefix_communication_sound.mp3"),
+)
+TTS_SUFFIX_PATH = os.environ.get(
+    "TTS_SUFFIX_PATH",
+    str(_BAR_ROOT / "sounds/voice-soundeffects/suffix_transmission.mp3"),
+)
+TTS_SFX_VOLUME_DB    = float(os.environ.get("TTS_SFX_VOLUME_DB",    "10"))
+TTS_PREFIX_VOLUME_DB = float(os.environ.get("TTS_PREFIX_VOLUME_DB",  "10"))
+TTS_SUFFIX_VOLUME_DB = float(os.environ.get("TTS_SUFFIX_VOLUME_DB",  "10"))
 # Fallback TTS player when sounddevice output is unavailable (e.g. WSL).
 # Raw PCM s16le 16 kHz mono is written to its stdin.
 TTS_PLAYER_CMD = os.environ.get(
@@ -128,6 +152,14 @@ except ValueError:
 _el_client = None  # ElevenLabs client (None when unavailable)
 _tts_lock = threading.Lock()  # serialises concurrent speak() calls
 
+# pydub for SFX mixing (optional)
+_pydub_available = False
+try:
+    from pydub import AudioSegment as _AudioSegment
+    _pydub_available = True
+except ImportError:
+    pass
+
 try:
     from elevenlabs import ElevenLabs as _ElevenLabs
     import numpy as _np
@@ -147,8 +179,9 @@ try:
             if _sd_output_available
             else f"pipe→ {TTS_PLAYER_CMD.split()[0]}"
         )
+        _sfx_mode = "pydub SFX" if _pydub_available else "no SFX (pip install pydub)"
         print(
-            f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}"
+            f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}  sfx={_sfx_mode}"
         )
     else:
         print("[tts] ELEVENLABS_API_KEY not set — TTS disabled.")
@@ -156,15 +189,49 @@ except ImportError as _tts_import_err:
     print(f"[tts] Optional deps missing ({_tts_import_err}) — TTS disabled.")
     print("      pip install elevenlabs sounddevice numpy")
 
+# ---------------------------------------------------------------------------
+# Pre-load SFX arrays once at startup (avoid disk I/O on every _speak call)
+# ---------------------------------------------------------------------------
+_sfx_prefix_f32: "_np.ndarray | None" = None  # type: ignore[name-defined]
+_sfx_suffix_f32: "_np.ndarray | None" = None  # type: ignore[name-defined]
+_sfx_crackle_f32: "_np.ndarray | None" = None  # type: ignore[name-defined]
+
+def _preload_sfx() -> None:
+    """Load SFX MP3 files → float32 numpy arrays. Called once after imports succeed."""
+    global _sfx_prefix_f32, _sfx_suffix_f32, _sfx_crackle_f32
+    if not _pydub_available:
+        return
+    _SR = 16000
+    def _load(path: str, gain_db: float):
+        try:
+            seg = _AudioSegment.from_file(path)
+            seg = seg.set_channels(1).set_frame_rate(_SR).set_sample_width(2)
+            arr = _np.frombuffer(seg.raw_data, dtype=_np.int16).astype(_np.float32) / 32768.0
+            return arr * (10.0 ** (gain_db / 20.0))
+        except Exception as _e:
+            print(f"[tts] SFX preload failed ({path}): {_e}")
+            return None
+    _sfx_prefix_f32  = _load(TTS_PREFIX_PATH, TTS_PREFIX_VOLUME_DB)
+    _sfx_suffix_f32  = _load(TTS_SUFFIX_PATH, TTS_SUFFIX_VOLUME_DB)
+    _sfx_crackle_f32 = _load(TTS_SFX_PATH,   TTS_SFX_VOLUME_DB)
+    print("[tts] SFX arrays pre-loaded.")
+
+if _pydub_available and _el_client is not None:
+    _preload_sfx()
+
 
 def _speak(text: str, pose: str = "calm") -> None:
     """
-    Generate TTS audio via ElevenLabs (pcm_16000) and play it through
-    sounddevice, feeding per-chunk RMS amplitude to the game UI portrait.
-    pose: "attack" or "calm" — selects which sprite the game UI displays.
-    Blocks until playback is complete.
-    Audio is streamed: playback starts as soon as the first chunks arrive
-    (~300-500 ms) rather than waiting for the full generation to finish.
+    Generate TTS audio via ElevenLabs (pcm_16000, streamed) and play it through
+    sounddevice or a fallback pipe, feeding per-chunk RMS to the game UI portrait.
+
+    When pydub is installed:
+      - Prefix and suffix audio files are pre-loaded as numpy arrays and played
+        immediately before / after the streamed TTS — with no gap.
+      - A looping background crackle (SFX) is mixed into each TTS chunk in
+        real-time. The SFX stops the instant the TTS stream ends; it never bleeds
+        into the suffix or beyond.
+    Without pydub the raw PCM stream is played directly (no SFX).
     """
     if _el_client is None:
         return
@@ -174,25 +241,10 @@ def _speak(text: str, pose: str = "calm") -> None:
     if not clean:
         return
     try:
-        # Request raw PCM: s16le @ 16 kHz mono (no decoder needed).
-        # convert() returns a generator; we iterate it directly so playback
-        # starts with the first chunk instead of after full download.
-        raw_gen = _el_client.text_to_speech.convert(
-            voice_id=EL_VOICE_ID,
-            text=clean,
-            model_id=EL_MODEL_ID,
-            output_format="pcm_16000",
-        )
-        # Normalise to iterator (some API versions may return plain bytes)
-        if isinstance(raw_gen, (bytes, bytearray)):
-            raw_gen = iter([raw_gen])
-
         SAMPLE_RATE = 16000
         CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
         CHUNK_BYTES = CHUNK * 2  # 2 bytes per s16le sample
 
-        # /tts/start is sent just before the first audio block is played,
-        # not before, so the portrait appears in sync with the actual sound.
         portrait_started = False
 
         def _ensure_portrait_started() -> None:
@@ -204,16 +256,142 @@ def _speak(text: str, pose: str = "calm") -> None:
                 except Exception:
                     pass
 
-        leftover = b""  # incomplete PCM bytes carried between API chunks
+        # Use pre-loaded SFX arrays (loaded once at startup to avoid disk I/O here)
+        prefix_f32 = _sfx_prefix_f32
+        suffix_f32 = _sfx_suffix_f32
+        sfx_f32    = _sfx_crackle_f32
+        sfx_offset: int = 0  # current read position in the looping SFX array
+
+        def _mix_sfx(block: "_np.ndarray") -> "_np.ndarray":
+            """Add one chunk of looping SFX to block (in-place safe). SFX stops here."""
+            nonlocal sfx_offset
+            if sfx_f32 is None or len(sfx_f32) == 0:
+                return block
+            n = len(block)
+            sfx_chunk = _np.empty(n, dtype=_np.float32)
+            pos = 0
+            while pos < n:
+                avail = len(sfx_f32) - sfx_offset
+                take = min(avail, n - pos)
+                sfx_chunk[pos : pos + take] = sfx_f32[sfx_offset : sfx_offset + take]
+                pos += take
+                sfx_offset = (sfx_offset + take) % len(sfx_f32)
+            return _np.clip(block + sfx_chunk, -1.0, 1.0)
+
+        def _f32_to_bytes(arr: "_np.ndarray") -> bytes:
+            return (arr * 32767.0).astype(_np.int16).tobytes()
+
+        # ------------------------------------------------------------------
+        # Request streaming PCM from ElevenLabs (same for both paths)
+        # ------------------------------------------------------------------
+        raw_gen = _el_client.text_to_speech.convert(
+            voice_id=EL_VOICE_ID,
+            text=clean,
+            model_id=EL_MODEL_ID,
+            output_format="pcm_16000",
+        )
+        if isinstance(raw_gen, (bytes, bytearray)):
+            raw_gen = iter([raw_gen])
+
+        leftover = b""
 
         if _sd_output_available:
-            # Native path — works on most laptops / desktops
+            # Feed raw_gen via a producer thread so the audio consumer can write
+            # silence while waiting for the first network chunk — preventing the
+            # stream buffer underrun that causes the audible click/interruption.
+            _pcm_q: "_queue.Queue[bytes | None]" = _queue.Queue(maxsize=64)
+
+            def _producer() -> None:
+                try:
+                    for api_chunk in raw_gen:
+                        _pcm_q.put(api_chunk)
+                finally:
+                    _pcm_q.put(None)  # sentinel: stream is done
+
+            prod_thread = threading.Thread(target=_producer, daemon=True, name="tts-producer")
+            prod_thread.start()
+
+            _silence = _np.zeros(CHUNK, dtype=_np.float32)
+
             with _sd.OutputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="float32",
                 device=SD_OUTPUT_DEVICE,
+                latency="high",
             ) as stream:
+
+                # ── 1. Prefix ──────────────────────────────────────────────
+                if prefix_f32 is not None and len(prefix_f32):
+                    _ensure_portrait_started()
+                    for i in range(0, len(prefix_f32), CHUNK):
+                        blk = prefix_f32[i : i + CHUNK]
+                        if len(blk) < CHUNK:
+                            blk = _np.pad(blk, (0, CHUNK - len(blk)))
+                        stream.write(blk)
+
+                # ── 2. Streamed TTS + looping SFX overlay ──────────────────
+                # Silence blocks are written while the producer thread waits for
+                # the first network chunk, keeping the hardware buffer full.
+                _tts_done = False
+                while not _tts_done:
+                    try:
+                        api_chunk = _pcm_q.get(timeout=0.04)  # 40 ms silence granularity
+                    except _queue.Empty:
+                        stream.write(_silence)  # keep stream alive during network wait
+                        continue
+
+                    if api_chunk is None:
+                        _tts_done = True
+                        break
+
+                    leftover += api_chunk
+                    while len(leftover) >= CHUNK_BYTES:
+                        block_bytes = leftover[:CHUNK_BYTES]
+                        leftover = leftover[CHUNK_BYTES:]
+                        block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
+                        block_f32 = block_i16.astype(_np.float32) / 32768.0
+                        mixed = _mix_sfx(block_f32)
+                        _ensure_portrait_started()
+                        stream.write(mixed)
+                        rms = float(_np.sqrt(_np.mean(mixed**2)))
+                        amp_val = min(1.0, rms * EL_AMP_SCALE)
+                        threading.Thread(
+                            target=lambda v=amp_val: _post("/tts/amplitude", {"value": v}),
+                            daemon=True,
+                        ).start()
+
+                # Flush final partial chunk
+                if leftover:
+                    block_i16 = _np.frombuffer(leftover, dtype=_np.int16)
+                    block_f32 = block_i16.astype(_np.float32) / 32768.0
+                    mixed = _mix_sfx(block_f32)
+                    if len(mixed) < CHUNK:
+                        mixed = _np.pad(mixed, (0, CHUNK - len(mixed)))
+                    _ensure_portrait_started()
+                    stream.write(mixed)
+
+                prod_thread.join()
+
+                # ── 3. Suffix (SFX is NOT mixed in here) ───────────────────
+                if suffix_f32 is not None and len(suffix_f32):
+                    for i in range(0, len(suffix_f32), CHUNK):
+                        blk = suffix_f32[i : i + CHUNK]
+                        if len(blk) < CHUNK:
+                            blk = _np.pad(blk, (0, CHUNK - len(blk)))
+                        stream.write(blk)
+
+        else:
+            # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
+            cmd = TTS_PLAYER_CMD.split()
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            try:
+                # ── 1. Prefix ──────────────────────────────────────────────
+                if prefix_f32 is not None and len(prefix_f32):
+                    _ensure_portrait_started()
+                    proc.stdin.write(_f32_to_bytes(prefix_f32))
+
+                # ── 2. Streamed TTS + looping SFX overlay ──────────────────
                 for api_chunk in raw_gen:
                     leftover += api_chunk
                     while len(leftover) >= CHUNK_BYTES:
@@ -221,50 +399,27 @@ def _speak(text: str, pose: str = "calm") -> None:
                         leftover = leftover[CHUNK_BYTES:]
                         block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
                         block_f32 = block_i16.astype(_np.float32) / 32768.0
+                        mixed = _mix_sfx(block_f32)
                         _ensure_portrait_started()
-                        stream.write(block_f32)
-                        rms = float(_np.sqrt(_np.mean(block_f32**2)))
-                        try:
-                            _post(
-                                "/tts/amplitude",
-                                {"value": min(1.0, rms * EL_AMP_SCALE)},
-                            )
-                        except Exception:
-                            pass
-                # Flush remaining samples (last partial chunk from the generator)
+                        proc.stdin.write(_f32_to_bytes(mixed))
+                        rms = float(_np.sqrt(_np.mean(mixed**2)))
+                        amp_val = min(1.0, rms * EL_AMP_SCALE)
+                        threading.Thread(
+                            target=lambda v=amp_val: _post("/tts/amplitude", {"value": v}),
+                            daemon=True,
+                        ).start()
+
+                # Flush final partial chunk
                 if leftover:
                     block_i16 = _np.frombuffer(leftover, dtype=_np.int16)
                     block_f32 = block_i16.astype(_np.float32) / 32768.0
-                    pad = CHUNK - len(block_f32)
-                    if pad > 0:
-                        block_f32 = _np.pad(block_f32, (0, pad))
-                    _ensure_portrait_started()
-                    stream.write(block_f32)
-        else:
-            # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
-            cmd = TTS_PLAYER_CMD.split()
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            try:
-                for api_chunk in raw_gen:
-                    leftover += api_chunk
-                    while len(leftover) >= CHUNK_BYTES:
-                        block_bytes = leftover[:CHUNK_BYTES]
-                        leftover = leftover[CHUNK_BYTES:]
-                        _ensure_portrait_started()
-                        proc.stdin.write(block_bytes)
-                        block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
-                        chunk_f = block_i16.astype(_np.float32) / 32768.0
-                        rms = float(_np.sqrt(_np.mean(chunk_f**2)))
-                        try:
-                            _post(
-                                "/tts/amplitude",
-                                {"value": min(1.0, rms * EL_AMP_SCALE)},
-                            )
-                        except Exception:
-                            pass
-                # Flush remaining bytes (last partial chunk)
-                if leftover:
-                    proc.stdin.write(leftover)
+                    mixed = _mix_sfx(block_f32)
+                    proc.stdin.write(_f32_to_bytes(mixed))
+
+                # ── 3. Suffix (SFX is NOT mixed in here) ───────────────────
+                if suffix_f32 is not None and len(suffix_f32):
+                    proc.stdin.write(_f32_to_bytes(suffix_f32))
+
             finally:
                 try:
                     proc.stdin.close()
