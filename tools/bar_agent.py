@@ -21,16 +21,24 @@ Optional env vars:
     EL_VOICE_ID      – ElevenLabs voice ID (default: Adam)
     EL_MODEL_ID      – ElevenLabs model  (default: eleven_turbo_v2_5)
     EL_AMP_SCALE     – RMS→0-1 multiplier for shake effect (default: 5.0)
+    TTS_SFX_PATH     – background crackle path (default: sounds/voice-soundeffects/AMBSci-Soft,...)
+    TTS_PREFIX_PATH  – prefix beep path (default: sounds/voice-soundeffects/prefix_communication_sound.mp3)
+    TTS_SUFFIX_PATH  – suffix sound path (default: sounds/voice-soundeffects/suffix_transmission.mp3)
+    TTS_SFX_VOLUME_DB    – crackle gain in dB (default: 10)
+    TTS_PREFIX_VOLUME_DB – prefix gain in dB (default: 0)
+    TTS_SUFFIX_VOLUME_DB – suffix gain in dB (default: 0)
 
 Requirements
 ------------
     pip install 'strands-agents[mistral]' strands-agents-tools
     pip install elevenlabs sounddevice numpy   # optional, for TTS
+    pip install pydub                          # optional, for SFX overlay
 """
 
 import asyncio
 import json
 import os
+import datetime
 import queue as _queue
 import subprocess
 import sys
@@ -68,26 +76,28 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # seconds
 # ---------------------------------------------------------------------------
 # IPC files: default to the Spring write-data LuaUI/ folder
 # (tools/ → BAR.sdd/ → games/ → data/ → LuaUI/)
-_SCRIPT_DIR  = Path(__file__).parent
-_IPC_DIR     = Path(os.environ.get("STT_IPC_DIR",
-                    str(_SCRIPT_DIR.parent.parent.parent / "LuaUI")))
+_SCRIPT_DIR = Path(__file__).parent
+_IPC_DIR = Path(
+    os.environ.get("STT_IPC_DIR", str(_SCRIPT_DIR.parent.parent.parent / "LuaUI"))
+)
 _IPC_DIR.mkdir(parents=True, exist_ok=True)
 STT_TRIGGER_FILE = _IPC_DIR / "stt_trigger.flag"
-STT_STOP_FILE    = _IPC_DIR / "stt_stop.flag"
-STT_CANCEL_FILE  = _IPC_DIR / "stt_cancel.flag"
-STT_DONE_FILE    = _IPC_DIR / "stt_done.flag"
-STT_RESULT_FILE  = _IPC_DIR / "stt_result.txt"  # written for Lua HUD display
+STT_STOP_FILE = _IPC_DIR / "stt_stop.flag"
+STT_CANCEL_FILE = _IPC_DIR / "stt_cancel.flag"
+STT_DONE_FILE = _IPC_DIR / "stt_done.flag"
+STT_RESULT_FILE = _IPC_DIR / "stt_result.txt"  # written for Lua HUD display
 
 STT_SAMPLE_RATE = 16000
-STT_CHANNELS    = 1
-STT_BLOCK_SIZE  = 4096
-STT_CHUNK_SIZE  = STT_BLOCK_SIZE * 2  # bytes (int16)
-STT_MODEL       = "voxtral-mini-transcribe-realtime-2602"
+STT_CHANNELS = 1
+STT_BLOCK_SIZE = 4096
+STT_CHUNK_SIZE = STT_BLOCK_SIZE * 2  # bytes (int16)
+STT_MODEL = "voxtral-mini-transcribe-realtime-2602"
 
 # Check for sounddevice input/output (both may be unavailable in WSL)
 _sd_output_available = False  # updated below and again inside ElevenLabs block
 try:
     import sounddevice as _sd
+
     _sd_available = _sd.query_devices(kind="input") is not None
     try:
         _sd_output_available = _sd.query_devices(kind="output") is not None
@@ -100,9 +110,26 @@ except Exception:
 
 # ElevenLabs TTS (all optional — TTS silently disabled when unset/missing)
 EL_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
-EL_MODEL_ID = os.environ.get("EL_MODEL_ID", "eleven_turbo_v2_5")
+EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "HhHF7uHMEx2kpTutnYTv")  # Adam
+EL_MODEL_ID = os.environ.get("EL_MODEL_ID", "eleven_v3")
 EL_AMP_SCALE = float(os.environ.get("EL_AMP_SCALE", "5.0"))  # RMS → 0–1
+# Sound-effect overlay paths for TTS (pydub required; set to empty string to disable)
+_BAR_ROOT = _SCRIPT_DIR.parent
+TTS_SFX_PATH = os.environ.get(
+    "TTS_SFX_PATH",
+    str(_BAR_ROOT / "sounds/voice-soundeffects/AMBSci-Soft,_crackling_old_-Elevenlabs.mp3"),
+)
+TTS_PREFIX_PATH = os.environ.get(
+    "TTS_PREFIX_PATH",
+    str(_BAR_ROOT / "sounds/voice-soundeffects/prefix_communication_sound.mp3"),
+)
+TTS_SUFFIX_PATH = os.environ.get(
+    "TTS_SUFFIX_PATH",
+    str(_BAR_ROOT / "sounds/voice-soundeffects/suffix_transmission.mp3"),
+)
+TTS_SFX_VOLUME_DB    = float(os.environ.get("TTS_SFX_VOLUME_DB",    "10"))
+TTS_PREFIX_VOLUME_DB = float(os.environ.get("TTS_PREFIX_VOLUME_DB",  "10"))
+TTS_SUFFIX_VOLUME_DB = float(os.environ.get("TTS_SUFFIX_VOLUME_DB",  "10"))
 # Fallback TTS player when sounddevice output is unavailable (e.g. WSL).
 # Raw PCM s16le 16 kHz mono is written to its stdin.
 TTS_PLAYER_CMD = os.environ.get(
@@ -125,6 +152,14 @@ except ValueError:
 _el_client = None  # ElevenLabs client (None when unavailable)
 _tts_lock = threading.Lock()  # serialises concurrent speak() calls
 
+# pydub for SFX mixing (optional)
+_pydub_available = False
+try:
+    from pydub import AudioSegment as _AudioSegment
+    _pydub_available = True
+except ImportError:
+    pass
+
 try:
     from elevenlabs import ElevenLabs as _ElevenLabs
     import numpy as _np
@@ -139,21 +174,64 @@ try:
 
     if EL_API_KEY:
         _el_client = _ElevenLabs(api_key=EL_API_KEY)
-        _out_mode = "sounddevice" if _sd_output_available else f"pipe→ {TTS_PLAYER_CMD.split()[0]}"
-        print(f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}")
+        _out_mode = (
+            "sounddevice"
+            if _sd_output_available
+            else f"pipe→ {TTS_PLAYER_CMD.split()[0]}"
+        )
+        _sfx_mode = "pydub SFX" if _pydub_available else "no SFX (pip install pydub)"
+        print(
+            f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}  sfx={_sfx_mode}"
+        )
     else:
         print("[tts] ELEVENLABS_API_KEY not set — TTS disabled.")
 except ImportError as _tts_import_err:
     print(f"[tts] Optional deps missing ({_tts_import_err}) — TTS disabled.")
     print("      pip install elevenlabs sounddevice numpy")
 
+# ---------------------------------------------------------------------------
+# Pre-load SFX arrays once at startup (avoid disk I/O on every _speak call)
+# ---------------------------------------------------------------------------
+_sfx_prefix_f32: "_np.ndarray | None" = None  # type: ignore[name-defined]
+_sfx_suffix_f32: "_np.ndarray | None" = None  # type: ignore[name-defined]
+_sfx_crackle_f32: "_np.ndarray | None" = None  # type: ignore[name-defined]
+
+def _preload_sfx() -> None:
+    """Load SFX MP3 files → float32 numpy arrays. Called once after imports succeed."""
+    global _sfx_prefix_f32, _sfx_suffix_f32, _sfx_crackle_f32
+    if not _pydub_available:
+        return
+    _SR = 16000
+    def _load(path: str, gain_db: float):
+        try:
+            seg = _AudioSegment.from_file(path)
+            seg = seg.set_channels(1).set_frame_rate(_SR).set_sample_width(2)
+            arr = _np.frombuffer(seg.raw_data, dtype=_np.int16).astype(_np.float32) / 32768.0
+            return arr * (10.0 ** (gain_db / 20.0))
+        except Exception as _e:
+            print(f"[tts] SFX preload failed ({path}): {_e}")
+            return None
+    _sfx_prefix_f32  = _load(TTS_PREFIX_PATH, TTS_PREFIX_VOLUME_DB)
+    _sfx_suffix_f32  = _load(TTS_SUFFIX_PATH, TTS_SUFFIX_VOLUME_DB)
+    _sfx_crackle_f32 = _load(TTS_SFX_PATH,   TTS_SFX_VOLUME_DB)
+    print("[tts] SFX arrays pre-loaded.")
+
+if _pydub_available and _el_client is not None:
+    _preload_sfx()
+
 
 def _speak(text: str, pose: str = "calm") -> None:
     """
-    Generate TTS audio via ElevenLabs (pcm_16000) and play it through
-    sounddevice, feeding per-chunk RMS amplitude to the game UI portrait.
-    pose: "attack" or "calm" — selects which sprite the game UI displays.
-    Blocks until playback is complete.
+    Generate TTS audio via ElevenLabs (pcm_16000, streamed) and play it through
+    sounddevice or a fallback pipe, feeding per-chunk RMS to the game UI portrait.
+
+    When pydub is installed:
+      - Prefix and suffix audio files are pre-loaded as numpy arrays and played
+        immediately before / after the streamed TTS — with no gap.
+      - A looping background crackle (SFX) is mixed into each TTS chunk in
+        real-time. The SFX stops the instant the TTS stream ends; it never bleeds
+        into the suffix or beyond.
+    Without pydub the raw PCM stream is played directly (no SFX).
     """
     if _el_client is None:
         return
@@ -163,66 +241,185 @@ def _speak(text: str, pose: str = "calm") -> None:
     if not clean:
         return
     try:
-        # Request raw PCM: s16le @ 16 kHz mono (no decoder needed)
-        # convert() may return a generator of chunks — collect them all.
-        raw = _el_client.text_to_speech.convert(
+        SAMPLE_RATE = 16000
+        CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
+        CHUNK_BYTES = CHUNK * 2  # 2 bytes per s16le sample
+
+        portrait_started = False
+
+        def _ensure_portrait_started() -> None:
+            nonlocal portrait_started
+            if not portrait_started:
+                portrait_started = True
+                try:
+                    _post("/tts/start", {"duration": 30.0, "pose": pose})
+                except Exception:
+                    pass
+
+        # Use pre-loaded SFX arrays (loaded once at startup to avoid disk I/O here)
+        prefix_f32 = _sfx_prefix_f32
+        suffix_f32 = _sfx_suffix_f32
+        sfx_f32    = _sfx_crackle_f32
+        sfx_offset: int = 0  # current read position in the looping SFX array
+
+        def _mix_sfx(block: "_np.ndarray") -> "_np.ndarray":
+            """Add one chunk of looping SFX to block (in-place safe). SFX stops here."""
+            nonlocal sfx_offset
+            if sfx_f32 is None or len(sfx_f32) == 0:
+                return block
+            n = len(block)
+            sfx_chunk = _np.empty(n, dtype=_np.float32)
+            pos = 0
+            while pos < n:
+                avail = len(sfx_f32) - sfx_offset
+                take = min(avail, n - pos)
+                sfx_chunk[pos : pos + take] = sfx_f32[sfx_offset : sfx_offset + take]
+                pos += take
+                sfx_offset = (sfx_offset + take) % len(sfx_f32)
+            return _np.clip(block + sfx_chunk, -1.0, 1.0)
+
+        def _f32_to_bytes(arr: "_np.ndarray") -> bytes:
+            return (arr * 32767.0).astype(_np.int16).tobytes()
+
+        # ------------------------------------------------------------------
+        # Request streaming PCM from ElevenLabs (same for both paths)
+        # ------------------------------------------------------------------
+        raw_gen = _el_client.text_to_speech.convert(
             voice_id=EL_VOICE_ID,
             text=clean,
             model_id=EL_MODEL_ID,
             output_format="pcm_16000",
         )
-        audio_bytes: bytes = (
-            raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
-        )
-        # Keep int16 for direct piping; derive float32 for sounddevice + amplitude
-        audio_i16 = _np.frombuffer(audio_bytes, dtype=_np.int16)
-        audio_f32 = audio_i16.astype(_np.float32) / 32768.0
-        duration = len(audio_f32) / 16000.0
+        if isinstance(raw_gen, (bytes, bytearray)):
+            raw_gen = iter([raw_gen])
 
-        # Notify the game: show the portrait with the requested pose
-        try:
-            _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
-        except Exception:
-            pass
-
-        SAMPLE_RATE = 16000
-        CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
+        leftover = b""
 
         if _sd_output_available:
-            # Native path — works on most laptops / desktops
+            # Feed raw_gen via a producer thread so the audio consumer can write
+            # silence while waiting for the first network chunk — preventing the
+            # stream buffer underrun that causes the audible click/interruption.
+            _pcm_q: "_queue.Queue[bytes | None]" = _queue.Queue(maxsize=64)
+
+            def _producer() -> None:
+                try:
+                    for api_chunk in raw_gen:
+                        _pcm_q.put(api_chunk)
+                finally:
+                    _pcm_q.put(None)  # sentinel: stream is done
+
+            prod_thread = threading.Thread(target=_producer, daemon=True, name="tts-producer")
+            prod_thread.start()
+
+            _silence = _np.zeros(CHUNK, dtype=_np.float32)
+
             with _sd.OutputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
                 device=SD_OUTPUT_DEVICE,
+                latency="high",
             ) as stream:
-                for i in range(0, len(audio_f32), CHUNK):
-                    chunk = audio_f32[i : i + CHUNK]
-                    if len(chunk) < CHUNK:
-                        chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
-                    stream.write(chunk)
-                    rms = float(_np.sqrt(_np.mean(chunk**2)))
-                    amplitude = min(1.0, rms * EL_AMP_SCALE)
+
+                # ── 1. Prefix ──────────────────────────────────────────────
+                if prefix_f32 is not None and len(prefix_f32):
+                    _ensure_portrait_started()
+                    for i in range(0, len(prefix_f32), CHUNK):
+                        blk = prefix_f32[i : i + CHUNK]
+                        if len(blk) < CHUNK:
+                            blk = _np.pad(blk, (0, CHUNK - len(blk)))
+                        stream.write(blk)
+
+                # ── 2. Streamed TTS + looping SFX overlay ──────────────────
+                # Silence blocks are written while the producer thread waits for
+                # the first network chunk, keeping the hardware buffer full.
+                _tts_done = False
+                while not _tts_done:
                     try:
-                        _post("/tts/amplitude", {"value": amplitude})
-                    except Exception:
-                        pass
+                        api_chunk = _pcm_q.get(timeout=0.04)  # 40 ms silence granularity
+                    except _queue.Empty:
+                        stream.write(_silence)  # keep stream alive during network wait
+                        continue
+
+                    if api_chunk is None:
+                        _tts_done = True
+                        break
+
+                    leftover += api_chunk
+                    while len(leftover) >= CHUNK_BYTES:
+                        block_bytes = leftover[:CHUNK_BYTES]
+                        leftover = leftover[CHUNK_BYTES:]
+                        block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
+                        block_f32 = block_i16.astype(_np.float32) / 32768.0
+                        mixed = _mix_sfx(block_f32)
+                        _ensure_portrait_started()
+                        stream.write(mixed)
+                        rms = float(_np.sqrt(_np.mean(mixed**2)))
+                        amp_val = min(1.0, rms * EL_AMP_SCALE)
+                        threading.Thread(
+                            target=lambda v=amp_val: _post("/tts/amplitude", {"value": v}),
+                            daemon=True,
+                        ).start()
+
+                # Flush final partial chunk
+                if leftover:
+                    block_i16 = _np.frombuffer(leftover, dtype=_np.int16)
+                    block_f32 = block_i16.astype(_np.float32) / 32768.0
+                    mixed = _mix_sfx(block_f32)
+                    if len(mixed) < CHUNK:
+                        mixed = _np.pad(mixed, (0, CHUNK - len(mixed)))
+                    _ensure_portrait_started()
+                    stream.write(mixed)
+
+                prod_thread.join()
+
+                # ── 3. Suffix (SFX is NOT mixed in here) ───────────────────
+                if suffix_f32 is not None and len(suffix_f32):
+                    for i in range(0, len(suffix_f32), CHUNK):
+                        blk = suffix_f32[i : i + CHUNK]
+                        if len(blk) < CHUNK:
+                            blk = _np.pad(blk, (0, CHUNK - len(blk)))
+                        stream.write(blk)
+
         else:
             # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
             cmd = TTS_PLAYER_CMD.split()
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             try:
-                for i in range(0, len(audio_i16), CHUNK):
-                    chunk_i16 = audio_i16[i : i + CHUNK]
-                    if len(chunk_i16) < CHUNK:
-                        chunk_i16 = _np.pad(chunk_i16, (0, CHUNK - len(chunk_i16)))
-                    proc.stdin.write(chunk_i16.tobytes())
-                    # Amplitude for the portrait animation (same chunk)
-                    chunk_f = chunk_i16.astype(_np.float32) / 32768.0
-                    rms = float(_np.sqrt(_np.mean(chunk_f**2)))
-                    amplitude = min(1.0, rms * EL_AMP_SCALE)
-                    try:
-                        _post("/tts/amplitude", {"value": amplitude})
-                    except Exception:
-                        pass
+                # ── 1. Prefix ──────────────────────────────────────────────
+                if prefix_f32 is not None and len(prefix_f32):
+                    _ensure_portrait_started()
+                    proc.stdin.write(_f32_to_bytes(prefix_f32))
+
+                # ── 2. Streamed TTS + looping SFX overlay ──────────────────
+                for api_chunk in raw_gen:
+                    leftover += api_chunk
+                    while len(leftover) >= CHUNK_BYTES:
+                        block_bytes = leftover[:CHUNK_BYTES]
+                        leftover = leftover[CHUNK_BYTES:]
+                        block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
+                        block_f32 = block_i16.astype(_np.float32) / 32768.0
+                        mixed = _mix_sfx(block_f32)
+                        _ensure_portrait_started()
+                        proc.stdin.write(_f32_to_bytes(mixed))
+                        rms = float(_np.sqrt(_np.mean(mixed**2)))
+                        amp_val = min(1.0, rms * EL_AMP_SCALE)
+                        threading.Thread(
+                            target=lambda v=amp_val: _post("/tts/amplitude", {"value": v}),
+                            daemon=True,
+                        ).start()
+
+                # Flush final partial chunk
+                if leftover:
+                    block_i16 = _np.frombuffer(leftover, dtype=_np.int16)
+                    block_f32 = block_i16.astype(_np.float32) / 32768.0
+                    mixed = _mix_sfx(block_f32)
+                    proc.stdin.write(_f32_to_bytes(mixed))
+
+                # ── 3. Suffix (SFX is NOT mixed in here) ───────────────────
+                if suffix_f32 is not None and len(suffix_f32):
+                    proc.stdin.write(_f32_to_bytes(suffix_f32))
+
             finally:
                 try:
                     proc.stdin.close()
@@ -251,6 +448,8 @@ def _speak_async(text: str, pose: str = "calm") -> None:
     def _run() -> None:
         with _tts_lock:
             _speak(text, pose=pose)
+        # STT trigger is written inside _speak's finally block;
+        # _tts_lock ensures we don't overlap with another _speak call.
 
     threading.Thread(target=_run, daemon=True, name="tts").start()
 
@@ -924,11 +1123,11 @@ activeTasks: dict = {}
 # ---------------------------------------------------------------------------
 # Module-level work queue  (shared by chat-loop thread AND STT callback)
 # ---------------------------------------------------------------------------
-_work_queue:   _queue.PriorityQueue = _queue.PriorityQueue()
-_seq_counter:  int = 0
-_seq_lock:     threading.Lock = threading.Lock()
+_work_queue: _queue.PriorityQueue = _queue.PriorityQueue()
+_seq_counter: int = 0
+_seq_lock: threading.Lock = threading.Lock()
 _queued_tasks: set = set()
-_queued_lock:  threading.Lock = threading.Lock()
+_queued_lock: threading.Lock = threading.Lock()
 
 
 def _next_seq() -> int:
@@ -936,6 +1135,24 @@ def _next_seq() -> int:
     with _seq_lock:
         _seq_counter += 1
         return _seq_counter
+
+
+def _with_pings(msg: str) -> str:
+    """
+    Append any unread player map-pings to msg.
+    Example: "Build a turret here ! [Player pinged (1024, 512)]"
+    """
+    try:
+        pings = _get("/pings")
+        if pings:
+            parts = [f"({p['x']}, {p['z']})" for p in pings]
+            noun = "pinged" if len(parts) == 1 else "pinged"
+            suffix = " [Player " + noun + " " + ", ".join(parts) + "]"
+            print(f"[ping] attaching {len(parts)} ping(s) to message")
+            return msg + suffix
+    except Exception:
+        pass
+    return msg
 
 
 def _enqueue(inp: str, task_id: "str | None", priority: int) -> None:
@@ -947,16 +1164,18 @@ def _enqueue(inp: str, task_id: "str | None", priority: int) -> None:
                 return
             _queued_tasks.add(task_id)
     _work_queue.put((priority, _next_seq(), inp, task_id))
-    print(f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}")
+    print(
+        f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # STT coroutines  (Voxtral real-time transcription, merged from SpeechToTextDaemon)
 # ---------------------------------------------------------------------------
-_stt_audio_q: asyncio.Queue   # filled by audio_reader, consumed by gated_audio_stream
-_stt_start:   asyncio.Event   # key pressed
-_stt_stop:    asyncio.Event   # key released
-_stt_cancel:  asyncio.Event   # key cancelled
+_stt_audio_q: asyncio.Queue  # filled by audio_reader, consumed by gated_audio_stream
+_stt_start: asyncio.Event  # key pressed
+_stt_stop: asyncio.Event  # key released
+_stt_cancel: asyncio.Event  # key cancelled
 
 
 async def _stt_mic_stream() -> AsyncIterator[bytes]:
@@ -968,8 +1187,11 @@ async def _stt_mic_stream() -> AsyncIterator[bytes]:
         loop.call_soon_threadsafe(q.put_nowait, bytes(indata))
 
     with _sd.InputStream(
-        samplerate=STT_SAMPLE_RATE, channels=STT_CHANNELS,
-        dtype="int16", blocksize=STT_BLOCK_SIZE, callback=_cb,
+        samplerate=STT_SAMPLE_RATE,
+        channels=STT_CHANNELS,
+        dtype="int16",
+        blocksize=STT_BLOCK_SIZE,
+        callback=_cb,
     ):
         print("[stt] Microphone open via sounddevice.")
         while True:
@@ -1008,8 +1230,11 @@ async def _stt_gated_stream() -> AsyncIterator[bytes]:
     # Discard stale chunks
     drained = 0
     while not _stt_audio_q.empty():
-        try: _stt_audio_q.get_nowait(); drained += 1
-        except asyncio.QueueEmpty: break
+        try:
+            _stt_audio_q.get_nowait()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
     if drained:
         print(f"[stt] Drained {drained} stale audio chunk(s).")
 
@@ -1028,14 +1253,18 @@ async def _stt_gated_stream() -> AsyncIterator[bytes]:
             _stt_stop.clear()
             yield chunk
             while not _stt_audio_q.empty():
-                try: _stt_audio_q.get_nowait()
-                except asyncio.QueueEmpty: break
+                try:
+                    _stt_audio_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             return
         if _stt_cancel.is_set():
             _stt_cancel.clear()
             while not _stt_audio_q.empty():
-                try: _stt_audio_q.get_nowait()
-                except asyncio.QueueEmpty: break
+                try:
+                    _stt_audio_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             print("[stt] Cancelled.")
             return
         yield chunk
@@ -1099,9 +1328,10 @@ async def _stt_session_loop() -> None:
             if text:
                 # Write result for Lua widget HUD display (no chat send needed)
                 STT_RESULT_FILE.write_text(text, encoding="utf-8")
-                print(f"[stt] Routing to agent: {text!r}")
+                enriched = _with_pings(text)
+                print(f"[stt] Routing to agent: {enriched!r}")
                 # Directly enqueue — no game-chat round-trip
-                _enqueue(f"[Voice] {text}", task_id=None, priority=0)
+                _enqueue(f"[Voice] {enriched}", task_id=None, priority=0)
             else:
                 print("[stt] Empty transcription.")
             # Write done flag so Lua widget resets its UI to idle
@@ -1135,29 +1365,53 @@ def _run_stt_loop() -> None:
     global _stt_audio_q, _stt_start, _stt_stop, _stt_cancel
 
     # Clean stale flag files from previous runs
-    for f in [STT_TRIGGER_FILE, STT_STOP_FILE, STT_CANCEL_FILE,
-              STT_DONE_FILE, STT_RESULT_FILE]:
+    for f in [
+        STT_TRIGGER_FILE,
+        STT_STOP_FILE,
+        STT_CANCEL_FILE,
+        STT_DONE_FILE,
+        STT_RESULT_FILE,
+    ]:
         f.unlink(missing_ok=True)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _stt_audio_q = asyncio.Queue()
-    _stt_start   = asyncio.Event()
-    _stt_stop    = asyncio.Event()
-    _stt_cancel  = asyncio.Event()
+    _stt_start = asyncio.Event()
+    _stt_stop = asyncio.Event()
+    _stt_cancel = asyncio.Event()
 
     print(f"[stt] STT thread started. IPC dir: {_IPC_DIR}")
-    print(f"[stt] Mic mode: {'sounddevice' if _sd_available else 'stdin (ffmpeg pipe)'}")
+    print(
+        f"[stt] Mic mode: {'sounddevice' if _sd_available else 'stdin (ffmpeg pipe)'}"
+    )
     try:
-        loop.run_until_complete(asyncio.gather(
-            _stt_audio_reader(),
-            _stt_session_loop(),
-            _stt_trigger_loop(),
-        ))
+        loop.run_until_complete(
+            asyncio.gather(
+                _stt_audio_reader(),
+                _stt_session_loop(),
+                _stt_trigger_loop(),
+            )
+        )
     except Exception as exc:
         print(f"[stt] Fatal error in STT loop: {exc}")
     finally:
         loop.close()
+
+
+last_exec = None
+
+
+def time_since_last_execution():
+    global last_exec
+    now = time.time()
+    if last_exec is None:
+        last_exec = now
+        return None
+    elapsed = now - last_exec
+    last_exec = now
+    # format elapsed as human-readable string
+    return str(datetime.timedelta(seconds=elapsed))
 
 
 # ---------------------------------------------------------------------------
@@ -1290,7 +1544,8 @@ def build_agent() -> Agent:
     return Agent(
         model=model,
         tools=BAR_TOOLS,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT
+        + f"\n [LAST EXECUTION] \n {time_since_last_execution()} ago.",
         callback_handler=_cb,
     )
 
@@ -1410,7 +1665,7 @@ def run_chat_loop(agent: Agent) -> None:
             if text.startswith("[AgentBridge"):
                 continue
             if _should_route(text):
-                user_input = _strip_prefix(text)
+                user_input = _with_pings(_strip_prefix(text))
                 print(f"[→ agent] routing: {user_input!r}")
                 _enqueue(user_input, task_id=None, priority=0)
             else:
@@ -1464,9 +1719,7 @@ def main() -> None:
     agent = build_agent()
 
     # Start the STT daemon thread (voice → Voxtral → agent queue, no chat hop)
-    stt_thread = threading.Thread(
-        target=_run_stt_loop, daemon=True, name="stt-daemon"
-    )
+    stt_thread = threading.Thread(target=_run_stt_loop, daemon=True, name="stt-daemon")
     stt_thread.start()
     print("[main] STT daemon thread started.")
 
