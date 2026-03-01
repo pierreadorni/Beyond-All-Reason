@@ -194,10 +194,10 @@ function widget:Update(dt)
 		os.remove(DONE_FILE)
 		text = text:match("^%s*(.-)%s*$")
 		if text and text ~= "" then
-			Spring.SendCommands("say " .. text)
-			log("Sent to chat: " .. text)
+			-- bar_agent.py handles the transcription directly (no chat round-trip)
+			log("Transcription received by agent: " .. text)
 		else
-			log("Empty transcription — nothing sent.")
+			log("Empty transcription.")
 		end
 		state = "idle"
 		return
