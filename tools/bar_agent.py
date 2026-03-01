@@ -21,14 +21,23 @@ Optional env vars:
     EL_VOICE_ID      – ElevenLabs voice ID (default: Adam)
     EL_MODEL_ID      – ElevenLabs model  (default: eleven_turbo_v2_5)
     EL_AMP_SCALE     – RMS→0-1 multiplier for shake effect (default: 5.0)
+    TTS_SFX_PATH     – background radio crackle mp3 (default: sounds/voice-soundeffects/...)
+    TTS_PREFIX_PATH  – comm-open prefix mp3
+    TTS_SUFFIX_PATH  – transmission-end suffix mp3
+    TTS_SFX_VOLUME_DB    – crackle volume offset in dB (default: 10)
+    TTS_PREFIX_VOLUME_DB – prefix volume offset in dB (default: 0)
+    TTS_SUFFIX_VOLUME_DB – suffix volume offset in dB (default: 0)
+    TTS_PLAYER_CMD_MP3 – ffplay command for mp3 piping (default: ffplay.exe -f mp3 ...)
 
 Requirements
 ------------
     pip install 'strands-agents[mistral]' strands-agents-tools
     pip install elevenlabs sounddevice numpy   # optional, for TTS
+    pip install pydub                          # optional, for radio SFX mixing
 """
 
 import asyncio
+import io
 import json
 import os
 import queue as _queue
@@ -109,6 +118,23 @@ TTS_PLAYER_CMD = os.environ.get(
     "TTS_PLAYER_CMD",
     "ffplay.exe -f s16le -ar 16000 -nodisp -autoexit -",
 )
+# Fallback TTS player when using mp3 output (pydub mixing path).
+TTS_PLAYER_CMD_MP3 = os.environ.get(
+    "TTS_PLAYER_CMD_MP3",
+    "ffplay.exe -f mp3 -nodisp -autoexit -",
+)
+# TTS sound-effect mixing via pydub (radio / comm effect).
+# Paths are resolved relative to the BAR.sdd root.
+_BAR_ROOT = _SCRIPT_DIR.parent
+TTS_SFX_PATH    = os.environ.get("TTS_SFX_PATH",
+    str(_BAR_ROOT / "sounds" / "voice-soundeffects" / "AMBSci-Soft,_crackling_old_-Elevenlabs.mp3"))
+TTS_PREFIX_PATH = os.environ.get("TTS_PREFIX_PATH",
+    str(_BAR_ROOT / "sounds" / "voice-soundeffects" / "prefix_communication_sound.mp3"))
+TTS_SUFFIX_PATH = os.environ.get("TTS_SUFFIX_PATH",
+    str(_BAR_ROOT / "sounds" / "voice-soundeffects" / "suffix_transmission.mp3"))
+TTS_SFX_VOLUME_DB    = int(os.environ.get("TTS_SFX_VOLUME_DB",    "10"))  # background crackle
+TTS_PREFIX_VOLUME_DB = int(os.environ.get("TTS_PREFIX_VOLUME_DB", "0"))   # prefix beep
+TTS_SUFFIX_VOLUME_DB = int(os.environ.get("TTS_SUFFIX_VOLUME_DB", "0"))   # suffix sound
 # Optional: index or substring of the output device name for sounddevice.
 # Leave unset to use the system default output device.
 # List devices: python -c "import sounddevice; print(sounddevice.query_devices())"
@@ -124,6 +150,13 @@ except ValueError:
 # ---------------------------------------------------------------------------
 _el_client = None  # ElevenLabs client (None when unavailable)
 _tts_lock = threading.Lock()  # serialises concurrent speak() calls
+
+# pydub SFX mixing (set inside the try block below)
+_pydub_available = False
+_AudioSegment = None  # pydub.AudioSegment class (None when unavailable)
+_tts_sfx    = None   # background radio crackle AudioSegment
+_tts_prefix = None   # prefix beep AudioSegment
+_tts_suffix = None   # suffix transmission AudioSegment
 
 try:
     from elevenlabs import ElevenLabs as _ElevenLabs
@@ -147,11 +180,41 @@ except ImportError as _tts_import_err:
     print(f"[tts] Optional deps missing ({_tts_import_err}) — TTS disabled.")
     print("      pip install elevenlabs sounddevice numpy")
 
+# pydub for radio SFX mixing (optional — SFX silently skipped when missing)
+try:
+    from pydub import AudioSegment as _AudioSegment
+
+    _pydub_available = True
+
+    def _load_sfx(path: str, volume_db: int = 0):
+        """Load an mp3 SFX file and apply a volume offset. Returns None on failure."""
+        try:
+            seg = _AudioSegment.from_file(path, format="mp3")
+            return seg + volume_db if volume_db else seg
+        except Exception as _e:
+            print(f"[tts] SFX not found ({path}): {_e}")
+            return None
+
+    _tts_sfx    = _load_sfx(TTS_SFX_PATH,    TTS_SFX_VOLUME_DB)
+    _tts_prefix = _load_sfx(TTS_PREFIX_PATH, TTS_PREFIX_VOLUME_DB)
+    _tts_suffix = _load_sfx(TTS_SUFFIX_PATH, TTS_SUFFIX_VOLUME_DB)
+    print(
+        f"[tts] pydub SFX mixing enabled  "
+        f"sfx={_tts_sfx is not None}  "
+        f"prefix={_tts_prefix is not None}  "
+        f"suffix={_tts_suffix is not None}"
+    )
+except ImportError:
+    print("[tts] pydub not installed — radio SFX mixing disabled.  pip install pydub")
+
 
 def _speak(text: str, pose: str = "calm") -> None:
     """
-    Generate TTS audio via ElevenLabs (pcm_16000) and play it through
-    sounddevice, feeding per-chunk RMS amplitude to the game UI portrait.
+    Generate TTS audio via ElevenLabs and play it, feeding per-chunk RMS
+    amplitude to the game UI portrait.
+    When pydub is available: requests mp3_44100_128, mixes in radio SFX
+    (background crackle overlay + prefix/suffix comm sounds) via pydub.
+    Falls back to raw pcm_16000 when pydub is not installed.
     pose: "attack" or "calm" — selects which sprite the game UI displays.
     Blocks until playback is complete.
     """
@@ -163,71 +226,165 @@ def _speak(text: str, pose: str = "calm") -> None:
     if not clean:
         return
     try:
-        # Request raw PCM: s16le @ 16 kHz mono (no decoder needed)
-        # convert() may return a generator of chunks — collect them all.
-        raw = _el_client.text_to_speech.convert(
-            voice_id=EL_VOICE_ID,
-            text=clean,
-            model_id=EL_MODEL_ID,
-            output_format="pcm_16000",
-        )
-        audio_bytes: bytes = (
-            raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
-        )
-        # Keep int16 for direct piping; derive float32 for sounddevice + amplitude
-        audio_i16 = _np.frombuffer(audio_bytes, dtype=_np.int16)
-        audio_f32 = audio_i16.astype(_np.float32) / 32768.0
-        duration = len(audio_f32) / 16000.0
+        if _pydub_available:
+            # ------------------------------------------------------------------
+            # pydub path: mp3_44100_128 + radio SFX mixing
+            # ------------------------------------------------------------------
+            raw = _el_client.text_to_speech.convert(
+                voice_id=EL_VOICE_ID,
+                text=clean,
+                model_id=EL_MODEL_ID,
+                output_format="mp3_44100_128",
+            )
+            audio_bytes: bytes = (
+                raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
+            )
 
-        # Notify the game: show the portrait with the requested pose
-        try:
-            _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
-        except Exception:
-            pass
+            speech = _AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
 
-        SAMPLE_RATE = 16000
-        CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
+            # Overlay looped background crackle SFX on the speech
+            if _tts_sfx is not None:
+                sfx = _tts_sfx
+                if len(sfx) < len(speech):
+                    sfx = sfx * (len(speech) // len(sfx) + 1)
+                sfx = sfx[: len(speech)]
+                speech_mixed = speech.overlay(sfx)
+            else:
+                speech_mixed = speech
 
-        if _sd_output_available:
-            # Native path — works on most laptops / desktops
-            with _sd.OutputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                device=SD_OUTPUT_DEVICE,
-            ) as stream:
-                for i in range(0, len(audio_f32), CHUNK):
-                    chunk = audio_f32[i : i + CHUNK]
-                    if len(chunk) < CHUNK:
-                        chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
-                    stream.write(chunk)
-                    rms = float(_np.sqrt(_np.mean(chunk**2)))
-                    amplitude = min(1.0, rms * EL_AMP_SCALE)
-                    try:
-                        _post("/tts/amplitude", {"value": amplitude})
-                    except Exception:
-                        pass
-        else:
-            # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
-            cmd = TTS_PLAYER_CMD.split()
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            # Assemble: [prefix] + (speech + sfx) + [suffix]
+            mixed = speech_mixed
+            if _tts_prefix is not None:
+                mixed = _tts_prefix + mixed
+            if _tts_suffix is not None:
+                mixed = mixed + _tts_suffix
+
+            SAMPLE_RATE = mixed.frame_rate
+            CHUNK = int(SAMPLE_RATE * 0.05)  # ~50 ms blocks
+
+            # Derive float32 array for amplitude tracking
+            mono = mixed.set_channels(1).set_frame_rate(SAMPLE_RATE).set_sample_width(2)
+            audio_f32 = (
+                _np.frombuffer(mono.raw_data, dtype=_np.int16).astype(_np.float32)
+                / 32768.0
+            )
+            duration = len(audio_f32) / SAMPLE_RATE
+
+            # Notify the game: show the portrait with the requested pose
             try:
-                for i in range(0, len(audio_i16), CHUNK):
-                    chunk_i16 = audio_i16[i : i + CHUNK]
-                    if len(chunk_i16) < CHUNK:
-                        chunk_i16 = _np.pad(chunk_i16, (0, CHUNK - len(chunk_i16)))
-                    proc.stdin.write(chunk_i16.tobytes())
-                    # Amplitude for the portrait animation (same chunk)
-                    chunk_f = chunk_i16.astype(_np.float32) / 32768.0
-                    rms = float(_np.sqrt(_np.mean(chunk_f**2)))
-                    amplitude = min(1.0, rms * EL_AMP_SCALE)
+                _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
+            except Exception:
+                pass
+
+            if _sd_output_available:
+                # Native path — play float32 via sounddevice
+                with _sd.OutputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype="float32",
+                    device=SD_OUTPUT_DEVICE,
+                ) as stream:
+                    for i in range(0, len(audio_f32), CHUNK):
+                        chunk = audio_f32[i : i + CHUNK]
+                        if len(chunk) < CHUNK:
+                            chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
+                        stream.write(chunk)
+                        rms = float(_np.sqrt(_np.mean(chunk**2)))
+                        amplitude = min(1.0, rms * EL_AMP_SCALE)
+                        try:
+                            _post("/tts/amplitude", {"value": amplitude})
+                        except Exception:
+                            pass
+            else:
+                # WSL / no-output-device fallback: export mixed audio as mp3
+                # and pipe to ffplay; send amplitude updates in parallel.
+                buf = io.BytesIO()
+                mixed.export(buf, format="mp3")
+                mp3_bytes = buf.getvalue()
+                cmd = TTS_PLAYER_CMD_MP3.split()
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                try:
+                    proc.stdin.write(mp3_bytes)
+                    proc.stdin.close()
+                    # Amplitude updates (approximate — runs while ffplay decodes)
+                    for i in range(0, len(audio_f32), CHUNK):
+                        chunk_f = audio_f32[i : i + CHUNK]
+                        rms = float(_np.sqrt(_np.mean(chunk_f**2)))
+                        amplitude = min(1.0, rms * EL_AMP_SCALE)
+                        try:
+                            _post("/tts/amplitude", {"value": amplitude})
+                        except Exception:
+                            pass
+                        time.sleep(CHUNK / SAMPLE_RATE)
+                except Exception:
                     try:
-                        _post("/tts/amplitude", {"value": amplitude})
+                        proc.stdin.close()
                     except Exception:
                         pass
-            finally:
+                proc.wait()
+        else:
+            # ------------------------------------------------------------------
+            # Legacy path: raw PCM s16le @ 16 kHz — no SFX mixing
+            # ------------------------------------------------------------------
+            raw = _el_client.text_to_speech.convert(
+                voice_id=EL_VOICE_ID,
+                text=clean,
+                model_id=EL_MODEL_ID,
+                output_format="pcm_16000",
+            )
+            audio_bytes = (
+                raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
+            )
+            audio_i16 = _np.frombuffer(audio_bytes, dtype=_np.int16)
+            audio_f32 = audio_i16.astype(_np.float32) / 32768.0
+            duration = len(audio_f32) / 16000.0
+
+            try:
+                _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
+            except Exception:
+                pass
+
+            SAMPLE_RATE = 16000
+            CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
+
+            if _sd_output_available:
+                with _sd.OutputStream(
+                    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                    device=SD_OUTPUT_DEVICE,
+                ) as stream:
+                    for i in range(0, len(audio_f32), CHUNK):
+                        chunk = audio_f32[i : i + CHUNK]
+                        if len(chunk) < CHUNK:
+                            chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
+                        stream.write(chunk)
+                        rms = float(_np.sqrt(_np.mean(chunk**2)))
+                        amplitude = min(1.0, rms * EL_AMP_SCALE)
+                        try:
+                            _post("/tts/amplitude", {"value": amplitude})
+                        except Exception:
+                            pass
+            else:
+                # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
+                cmd = TTS_PLAYER_CMD.split()
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
                 try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+                    for i in range(0, len(audio_i16), CHUNK):
+                        chunk_i16 = audio_i16[i : i + CHUNK]
+                        if len(chunk_i16) < CHUNK:
+                            chunk_i16 = _np.pad(chunk_i16, (0, CHUNK - len(chunk_i16)))
+                        proc.stdin.write(chunk_i16.tobytes())
+                        chunk_f = chunk_i16.astype(_np.float32) / 32768.0
+                        rms = float(_np.sqrt(_np.mean(chunk_f**2)))
+                        amplitude = min(1.0, rms * EL_AMP_SCALE)
+                        try:
+                            _post("/tts/amplitude", {"value": amplitude})
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
                 proc.wait()
 
     except Exception as exc:
