@@ -21,25 +21,17 @@ Optional env vars:
     EL_VOICE_ID      – ElevenLabs voice ID (default: Adam)
     EL_MODEL_ID      – ElevenLabs model  (default: eleven_turbo_v2_5)
     EL_AMP_SCALE     – RMS→0-1 multiplier for shake effect (default: 5.0)
-    TTS_SFX_PATH     – background radio crackle mp3 (default: sounds/voice-soundeffects/...)
-    TTS_PREFIX_PATH  – comm-open prefix mp3
-    TTS_SUFFIX_PATH  – transmission-end suffix mp3
-    TTS_SFX_VOLUME_DB    – crackle volume offset in dB (default: 10)
-    TTS_PREFIX_VOLUME_DB – prefix volume offset in dB (default: 0)
-    TTS_SUFFIX_VOLUME_DB – suffix volume offset in dB (default: 0)
-    TTS_PLAYER_CMD_MP3 – ffplay command for mp3 piping (default: ffplay.exe -f mp3 ...)
 
 Requirements
 ------------
     pip install 'strands-agents[mistral]' strands-agents-tools
     pip install elevenlabs sounddevice numpy   # optional, for TTS
-    pip install pydub                          # optional, for radio SFX mixing
 """
 
 import asyncio
-import io
 import json
 import os
+import datetime
 import queue as _queue
 import subprocess
 import sys
@@ -77,26 +69,28 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # seconds
 # ---------------------------------------------------------------------------
 # IPC files: default to the Spring write-data LuaUI/ folder
 # (tools/ → BAR.sdd/ → games/ → data/ → LuaUI/)
-_SCRIPT_DIR  = Path(__file__).parent
-_IPC_DIR     = Path(os.environ.get("STT_IPC_DIR",
-                    str(_SCRIPT_DIR.parent.parent.parent / "LuaUI")))
+_SCRIPT_DIR = Path(__file__).parent
+_IPC_DIR = Path(
+    os.environ.get("STT_IPC_DIR", str(_SCRIPT_DIR.parent.parent.parent / "LuaUI"))
+)
 _IPC_DIR.mkdir(parents=True, exist_ok=True)
 STT_TRIGGER_FILE = _IPC_DIR / "stt_trigger.flag"
-STT_STOP_FILE    = _IPC_DIR / "stt_stop.flag"
-STT_CANCEL_FILE  = _IPC_DIR / "stt_cancel.flag"
-STT_DONE_FILE    = _IPC_DIR / "stt_done.flag"
-STT_RESULT_FILE  = _IPC_DIR / "stt_result.txt"  # written for Lua HUD display
+STT_STOP_FILE = _IPC_DIR / "stt_stop.flag"
+STT_CANCEL_FILE = _IPC_DIR / "stt_cancel.flag"
+STT_DONE_FILE = _IPC_DIR / "stt_done.flag"
+STT_RESULT_FILE = _IPC_DIR / "stt_result.txt"  # written for Lua HUD display
 
 STT_SAMPLE_RATE = 16000
-STT_CHANNELS    = 1
-STT_BLOCK_SIZE  = 4096
-STT_CHUNK_SIZE  = STT_BLOCK_SIZE * 2  # bytes (int16)
-STT_MODEL       = "voxtral-mini-transcribe-realtime-2602"
+STT_CHANNELS = 1
+STT_BLOCK_SIZE = 4096
+STT_CHUNK_SIZE = STT_BLOCK_SIZE * 2  # bytes (int16)
+STT_MODEL = "voxtral-mini-transcribe-realtime-2602"
 
 # Check for sounddevice input/output (both may be unavailable in WSL)
 _sd_output_available = False  # updated below and again inside ElevenLabs block
 try:
     import sounddevice as _sd
+
     _sd_available = _sd.query_devices(kind="input") is not None
     try:
         _sd_output_available = _sd.query_devices(kind="output") is not None
@@ -118,23 +112,6 @@ TTS_PLAYER_CMD = os.environ.get(
     "TTS_PLAYER_CMD",
     "ffplay.exe -f s16le -ar 16000 -nodisp -autoexit -",
 )
-# Fallback TTS player when using mp3 output (pydub mixing path).
-TTS_PLAYER_CMD_MP3 = os.environ.get(
-    "TTS_PLAYER_CMD_MP3",
-    "ffplay.exe -f mp3 -nodisp -autoexit -",
-)
-# TTS sound-effect mixing via pydub (radio / comm effect).
-# Paths are resolved relative to the BAR.sdd root.
-_BAR_ROOT = _SCRIPT_DIR.parent
-TTS_SFX_PATH    = os.environ.get("TTS_SFX_PATH",
-    str(_BAR_ROOT / "sounds" / "voice-soundeffects" / "AMBSci-Soft,_crackling_old_-Elevenlabs.mp3"))
-TTS_PREFIX_PATH = os.environ.get("TTS_PREFIX_PATH",
-    str(_BAR_ROOT / "sounds" / "voice-soundeffects" / "prefix_communication_sound.mp3"))
-TTS_SUFFIX_PATH = os.environ.get("TTS_SUFFIX_PATH",
-    str(_BAR_ROOT / "sounds" / "voice-soundeffects" / "suffix_transmission.mp3"))
-TTS_SFX_VOLUME_DB    = int(os.environ.get("TTS_SFX_VOLUME_DB",    "10"))  # background crackle
-TTS_PREFIX_VOLUME_DB = int(os.environ.get("TTS_PREFIX_VOLUME_DB", "0"))   # prefix beep
-TTS_SUFFIX_VOLUME_DB = int(os.environ.get("TTS_SUFFIX_VOLUME_DB", "0"))   # suffix sound
 # Optional: index or substring of the output device name for sounddevice.
 # Leave unset to use the system default output device.
 # List devices: python -c "import sounddevice; print(sounddevice.query_devices())"
@@ -151,13 +128,6 @@ except ValueError:
 _el_client = None  # ElevenLabs client (None when unavailable)
 _tts_lock = threading.Lock()  # serialises concurrent speak() calls
 
-# pydub SFX mixing (set inside the try block below)
-_pydub_available = False
-_AudioSegment = None  # pydub.AudioSegment class (None when unavailable)
-_tts_sfx    = None   # background radio crackle AudioSegment
-_tts_prefix = None   # prefix beep AudioSegment
-_tts_suffix = None   # suffix transmission AudioSegment
-
 try:
     from elevenlabs import ElevenLabs as _ElevenLabs
     import numpy as _np
@@ -172,51 +142,29 @@ try:
 
     if EL_API_KEY:
         _el_client = _ElevenLabs(api_key=EL_API_KEY)
-        _out_mode = "sounddevice" if _sd_output_available else f"pipe→ {TTS_PLAYER_CMD.split()[0]}"
-        print(f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}")
+        _out_mode = (
+            "sounddevice"
+            if _sd_output_available
+            else f"pipe→ {TTS_PLAYER_CMD.split()[0]}"
+        )
+        print(
+            f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}"
+        )
     else:
         print("[tts] ELEVENLABS_API_KEY not set — TTS disabled.")
 except ImportError as _tts_import_err:
     print(f"[tts] Optional deps missing ({_tts_import_err}) — TTS disabled.")
     print("      pip install elevenlabs sounddevice numpy")
 
-# pydub for radio SFX mixing (optional — SFX silently skipped when missing)
-try:
-    from pydub import AudioSegment as _AudioSegment
-
-    _pydub_available = True
-
-    def _load_sfx(path: str, volume_db: int = 0):
-        """Load an mp3 SFX file and apply a volume offset. Returns None on failure."""
-        try:
-            seg = _AudioSegment.from_file(path, format="mp3")
-            return seg + volume_db if volume_db else seg
-        except Exception as _e:
-            print(f"[tts] SFX not found ({path}): {_e}")
-            return None
-
-    _tts_sfx    = _load_sfx(TTS_SFX_PATH,    TTS_SFX_VOLUME_DB)
-    _tts_prefix = _load_sfx(TTS_PREFIX_PATH, TTS_PREFIX_VOLUME_DB)
-    _tts_suffix = _load_sfx(TTS_SUFFIX_PATH, TTS_SUFFIX_VOLUME_DB)
-    print(
-        f"[tts] pydub SFX mixing enabled  "
-        f"sfx={_tts_sfx is not None}  "
-        f"prefix={_tts_prefix is not None}  "
-        f"suffix={_tts_suffix is not None}"
-    )
-except ImportError:
-    print("[tts] pydub not installed — radio SFX mixing disabled.  pip install pydub")
-
 
 def _speak(text: str, pose: str = "calm") -> None:
     """
-    Generate TTS audio via ElevenLabs and play it, feeding per-chunk RMS
-    amplitude to the game UI portrait.
-    When pydub is available: requests mp3_44100_128, mixes in radio SFX
-    (background crackle overlay + prefix/suffix comm sounds) via pydub.
-    Falls back to raw pcm_16000 when pydub is not installed.
+    Generate TTS audio via ElevenLabs (pcm_16000) and play it through
+    sounddevice, feeding per-chunk RMS amplitude to the game UI portrait.
     pose: "attack" or "calm" — selects which sprite the game UI displays.
     Blocks until playback is complete.
+    Audio is streamed: playback starts as soon as the first chunks arrive
+    (~300-500 ms) rather than waiting for the full generation to finish.
     """
     if _el_client is None:
         return
@@ -226,165 +174,102 @@ def _speak(text: str, pose: str = "calm") -> None:
     if not clean:
         return
     try:
-        if _pydub_available:
-            # ------------------------------------------------------------------
-            # pydub path: mp3_44100_128 + radio SFX mixing
-            # ------------------------------------------------------------------
-            raw = _el_client.text_to_speech.convert(
-                voice_id=EL_VOICE_ID,
-                text=clean,
-                model_id=EL_MODEL_ID,
-                output_format="mp3_44100_128",
-            )
-            audio_bytes: bytes = (
-                raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
-            )
+        # Request raw PCM: s16le @ 16 kHz mono (no decoder needed).
+        # convert() returns a generator; we iterate it directly so playback
+        # starts with the first chunk instead of after full download.
+        raw_gen = _el_client.text_to_speech.convert(
+            voice_id=EL_VOICE_ID,
+            text=clean,
+            model_id=EL_MODEL_ID,
+            output_format="pcm_16000",
+        )
+        # Normalise to iterator (some API versions may return plain bytes)
+        if isinstance(raw_gen, (bytes, bytearray)):
+            raw_gen = iter([raw_gen])
 
-            speech = _AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+        SAMPLE_RATE = 16000
+        CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
+        CHUNK_BYTES = CHUNK * 2  # 2 bytes per s16le sample
 
-            # Overlay looped background crackle SFX on the speech
-            if _tts_sfx is not None:
-                sfx = _tts_sfx
-                if len(sfx) < len(speech):
-                    sfx = sfx * (len(speech) // len(sfx) + 1)
-                sfx = sfx[: len(speech)]
-                speech_mixed = speech.overlay(sfx)
-            else:
-                speech_mixed = speech
+        # /tts/start is sent just before the first audio block is played,
+        # not before, so the portrait appears in sync with the actual sound.
+        portrait_started = False
 
-            # Assemble: [prefix] + (speech + sfx) + [suffix]
-            mixed = speech_mixed
-            if _tts_prefix is not None:
-                mixed = _tts_prefix + mixed
-            if _tts_suffix is not None:
-                mixed = mixed + _tts_suffix
-
-            SAMPLE_RATE = mixed.frame_rate
-            CHUNK = int(SAMPLE_RATE * 0.05)  # ~50 ms blocks
-
-            # Derive float32 array for amplitude tracking
-            mono = mixed.set_channels(1).set_frame_rate(SAMPLE_RATE).set_sample_width(2)
-            audio_f32 = (
-                _np.frombuffer(mono.raw_data, dtype=_np.int16).astype(_np.float32)
-                / 32768.0
-            )
-            duration = len(audio_f32) / SAMPLE_RATE
-
-            # Notify the game: show the portrait with the requested pose
-            try:
-                _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
-            except Exception:
-                pass
-
-            if _sd_output_available:
-                # Native path — play float32 via sounddevice
-                with _sd.OutputStream(
-                    samplerate=SAMPLE_RATE,
-                    channels=1,
-                    dtype="float32",
-                    device=SD_OUTPUT_DEVICE,
-                ) as stream:
-                    for i in range(0, len(audio_f32), CHUNK):
-                        chunk = audio_f32[i : i + CHUNK]
-                        if len(chunk) < CHUNK:
-                            chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
-                        stream.write(chunk)
-                        rms = float(_np.sqrt(_np.mean(chunk**2)))
-                        amplitude = min(1.0, rms * EL_AMP_SCALE)
-                        try:
-                            _post("/tts/amplitude", {"value": amplitude})
-                        except Exception:
-                            pass
-            else:
-                # WSL / no-output-device fallback: export mixed audio as mp3
-                # and pipe to ffplay; send amplitude updates in parallel.
-                buf = io.BytesIO()
-                mixed.export(buf, format="mp3")
-                mp3_bytes = buf.getvalue()
-                cmd = TTS_PLAYER_CMD_MP3.split()
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        def _ensure_portrait_started() -> None:
+            nonlocal portrait_started
+            if not portrait_started:
+                portrait_started = True
                 try:
-                    proc.stdin.write(mp3_bytes)
-                    proc.stdin.close()
-                    # Amplitude updates (approximate — runs while ffplay decodes)
-                    for i in range(0, len(audio_f32), CHUNK):
-                        chunk_f = audio_f32[i : i + CHUNK]
-                        rms = float(_np.sqrt(_np.mean(chunk_f**2)))
-                        amplitude = min(1.0, rms * EL_AMP_SCALE)
-                        try:
-                            _post("/tts/amplitude", {"value": amplitude})
-                        except Exception:
-                            pass
-                        time.sleep(CHUNK / SAMPLE_RATE)
+                    _post("/tts/start", {"duration": 30.0, "pose": pose})
                 except Exception:
-                    try:
-                        proc.stdin.close()
-                    except Exception:
-                        pass
-                proc.wait()
+                    pass
+
+        leftover = b""  # incomplete PCM bytes carried between API chunks
+
+        if _sd_output_available:
+            # Native path — works on most laptops / desktops
+            with _sd.OutputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                device=SD_OUTPUT_DEVICE,
+            ) as stream:
+                for api_chunk in raw_gen:
+                    leftover += api_chunk
+                    while len(leftover) >= CHUNK_BYTES:
+                        block_bytes = leftover[:CHUNK_BYTES]
+                        leftover = leftover[CHUNK_BYTES:]
+                        block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
+                        block_f32 = block_i16.astype(_np.float32) / 32768.0
+                        _ensure_portrait_started()
+                        stream.write(block_f32)
+                        rms = float(_np.sqrt(_np.mean(block_f32**2)))
+                        try:
+                            _post(
+                                "/tts/amplitude",
+                                {"value": min(1.0, rms * EL_AMP_SCALE)},
+                            )
+                        except Exception:
+                            pass
+                # Flush remaining samples (last partial chunk from the generator)
+                if leftover:
+                    block_i16 = _np.frombuffer(leftover, dtype=_np.int16)
+                    block_f32 = block_i16.astype(_np.float32) / 32768.0
+                    pad = CHUNK - len(block_f32)
+                    if pad > 0:
+                        block_f32 = _np.pad(block_f32, (0, pad))
+                    _ensure_portrait_started()
+                    stream.write(block_f32)
         else:
-            # ------------------------------------------------------------------
-            # Legacy path: raw PCM s16le @ 16 kHz — no SFX mixing
-            # ------------------------------------------------------------------
-            raw = _el_client.text_to_speech.convert(
-                voice_id=EL_VOICE_ID,
-                text=clean,
-                model_id=EL_MODEL_ID,
-                output_format="pcm_16000",
-            )
-            audio_bytes = (
-                raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
-            )
-            audio_i16 = _np.frombuffer(audio_bytes, dtype=_np.int16)
-            audio_f32 = audio_i16.astype(_np.float32) / 32768.0
-            duration = len(audio_f32) / 16000.0
-
+            # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
+            cmd = TTS_PLAYER_CMD.split()
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             try:
-                _post("/tts/start", {"duration": duration + 0.5, "pose": pose})
-            except Exception:
-                pass
-
-            SAMPLE_RATE = 16000
-            CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
-
-            if _sd_output_available:
-                with _sd.OutputStream(
-                    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                    device=SD_OUTPUT_DEVICE,
-                ) as stream:
-                    for i in range(0, len(audio_f32), CHUNK):
-                        chunk = audio_f32[i : i + CHUNK]
-                        if len(chunk) < CHUNK:
-                            chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
-                        stream.write(chunk)
-                        rms = float(_np.sqrt(_np.mean(chunk**2)))
-                        amplitude = min(1.0, rms * EL_AMP_SCALE)
-                        try:
-                            _post("/tts/amplitude", {"value": amplitude})
-                        except Exception:
-                            pass
-            else:
-                # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
-                cmd = TTS_PLAYER_CMD.split()
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                try:
-                    for i in range(0, len(audio_i16), CHUNK):
-                        chunk_i16 = audio_i16[i : i + CHUNK]
-                        if len(chunk_i16) < CHUNK:
-                            chunk_i16 = _np.pad(chunk_i16, (0, CHUNK - len(chunk_i16)))
-                        proc.stdin.write(chunk_i16.tobytes())
-                        chunk_f = chunk_i16.astype(_np.float32) / 32768.0
+                for api_chunk in raw_gen:
+                    leftover += api_chunk
+                    while len(leftover) >= CHUNK_BYTES:
+                        block_bytes = leftover[:CHUNK_BYTES]
+                        leftover = leftover[CHUNK_BYTES:]
+                        _ensure_portrait_started()
+                        proc.stdin.write(block_bytes)
+                        block_i16 = _np.frombuffer(block_bytes, dtype=_np.int16)
+                        chunk_f = block_i16.astype(_np.float32) / 32768.0
                         rms = float(_np.sqrt(_np.mean(chunk_f**2)))
-                        amplitude = min(1.0, rms * EL_AMP_SCALE)
                         try:
-                            _post("/tts/amplitude", {"value": amplitude})
+                            _post(
+                                "/tts/amplitude",
+                                {"value": min(1.0, rms * EL_AMP_SCALE)},
+                            )
                         except Exception:
                             pass
-                finally:
-                    try:
-                        proc.stdin.close()
-                    except Exception:
-                        pass
+                # Flush remaining bytes (last partial chunk)
+                if leftover:
+                    proc.stdin.write(leftover)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
                 proc.wait()
 
     except Exception as exc:
@@ -408,6 +293,8 @@ def _speak_async(text: str, pose: str = "calm") -> None:
     def _run() -> None:
         with _tts_lock:
             _speak(text, pose=pose)
+        # STT trigger is written inside _speak's finally block;
+        # _tts_lock ensures we don't overlap with another _speak call.
 
     threading.Thread(target=_run, daemon=True, name="tts").start()
 
@@ -461,128 +348,21 @@ def _post(path: str, body: dict) -> dict:
 
 
 @tool
-def get_game_state(mode: str = "summary") -> str:
+def get_game_state() -> str:
     """
-    Returns current global game state. Choose mode based on what you need:
+    Returns full current game state as JSON, including:
+    - allyTeams: list of teams with their units (id, defName, position,
+      health, category, buildOptions for factories)
+    - visibleEnemies: enemy units currently visible on the map
+    - mapInfo: map name, dimensions, wind speed, tidal strength
+    - gameFrame: current simulation frame (30 fps)
 
-    "summary" (default) — frame, mapInfo, per-team resources (metal/energy
-      income/expense/storage) and unit COUNTS per category. No individual
-      units. Use this for quick situational awareness before deciding what
-      to do. Cheapest call.
-
-    "units" — frame, mapInfo, per-team resources + slim unit list per team
-      (unitID, name, x/y/z, health/maxHealth, boolean flags). No buildOptions.
-      Use when you need unit positions or IDs across all teams.
-
-    "full" — same as "units" but also includes each unit's buildOptions name
-      list. Use only when you need to check build options for multiple units
-      at once; prefer get_unit_details([id]) for a single unit.
-
-    Args:
-        mode: One of "summary" (default), "units", "full".
-    """
-    _UNIT_SLIM = {
-        "unitID", "name", "x", "y", "z", "health", "maxHealth",
-        "isCommander", "isFactory", "isBuilder",
-        "canMove", "canAttack", "isExtractor", "isGenerator",
-    }
-
-    def _categorise(unit: dict) -> str:
-        is_cmd  = unit.get("isCommander", False)
-        is_fact = unit.get("isFactory",   False)
-        is_bld  = unit.get("isBuilder",   False)
-        can_mv  = unit.get("canMove",     False)
-        can_atk = unit.get("canAttack",   False)
-        is_ext  = unit.get("isExtractor", False)
-        is_gen  = unit.get("isGenerator", False)
-        if is_cmd:                                    return "commander"
-        if is_fact:                                   return "factory"
-        if is_bld and can_mv:                         return "constructor"
-        if can_mv and can_atk and not is_bld:         return "combat"
-        if not can_mv and can_atk and not is_fact:    return "defense"
-        if is_ext:                                    return "extractor"
-        if is_gen:                                    return "generator"
-        return "other"
-
-    try:
-        state = _get("/state")
-    except ConnectionError as e:
-        return f"ERROR: {e}"
-
-    _RESOURCE_KEYS = (
-        "teamID", "isBot", "isMyTeam", "luaAI",
-        "metal", "metalIncome", "metalExpense", "metalStorage",
-        "energy", "energyIncome", "energyExpense", "energyStorage",
-    )
-
-    teams_out = []
-    for team in state.get("teams", []):
-        entry = {k: team[k] for k in _RESOURCE_KEYS if k in team}
-        units = team.get("units", [])
-
-        if mode == "summary":
-            counts: dict = {}
-            for u in units:
-                cat = _categorise(u)
-                counts[cat] = counts.get(cat, 0) + 1
-            entry["unitCounts"] = counts
-
-        elif mode == "units":
-            entry["units"] = [
-                {k: v for k, v in u.items() if k in _UNIT_SLIM}
-                for u in units
-            ]
-
-        else:  # "full"
-            def _slim_full(u: dict) -> dict:
-                out = {k: v for k, v in u.items() if k in _UNIT_SLIM}
-                opts = u.get("buildOptions")
-                if opts:
-                    out["buildOptions"] = [o["name"] for o in opts]
-                return out
-            entry["units"] = [_slim_full(u) for u in units]
-
-        teams_out.append(entry)
-
-    out: dict = {
-        "frame": state.get("frame"),
-        "mapInfo": state.get("mapInfo"),
-        "teams": teams_out,
-    }
-    if mode == "summary":
-        out["visibleEnemyCount"] = len(state.get("visibleEnemies", []))
-    else:
-        out["visibleEnemies"] = state.get("visibleEnemies", [])
-
-    result = json.dumps(out, separators=(",", ":"))
-    print(f"[get_game_state] mode={mode!r} \n {result}")
-    return result
-
-
-@tool
-def get_game_frame() -> str:
-    """
-    Returns the current game frame number only. This is an extremely cheap call.
-
-    MANDATORY — call this at the very start of EVERY response, before anything else.
-    Use the returned frame to decide whether your cached state is stale:
-
-      • No prior get_game_state() in this conversation
-            → call get_game_state() immediately after.
-      • Current frame is more than 300 frames ahead of the frame in your last
-        get_game_state() response  (300 frames ≈ 10 seconds at 30 fps)
-            → state is STALE.  Call get_game_state() before answering or acting.
-      • Frame delta ≤ 300
-            → state is fresh enough.  You may skip get_game_state() and act on
-               cached data.
-
-    BAR runs at 30 frames/second.  Frame 9000 ≈ 5 minutes into the game.
+    Call this to understand the overall battlefield situation before
+    planning any actions.
     """
     try:
         state = _get("/state")
-        frame = state.get("frame", -1)
-        print(f"[get_game_frame] frame={frame}")
-        return json.dumps({"frame": frame})
+        return json.dumps(state, indent=2)
     except ConnectionError as e:
         return f"ERROR: {e}"
 
@@ -607,15 +387,12 @@ def get_build_catalog() -> str:
 @tool
 def get_new_chat_messages() -> str:
     """
-    INTERNAL — used by the agent polling loop (run_chat_loop), NOT by the LLM.
+    Drains and returns all chat messages that have arrived since the last
+    call. Returns a JSON list of objects: [{text, frame}, ...].
+    'text' is the raw console line (e.g. '[All] PlayerName: hello').
+    'frame' is the game frame when it was received.
 
-    The loop polls /chat automatically and routes each player message as a new
-    agent invocation.  The LLM should never call this tool directly — doing so
-    would produce an empty list (the loop already drained the queue) and risks
-    confusing the control flow.
-
-    Drains and returns all chat messages that have arrived since the last call.
-    Returns a JSON list of objects: [{text, frame}, ...].
+    Returns an empty list if no new messages are available.
     """
     try:
         msgs = _get("/chat")
@@ -715,12 +492,6 @@ def command_unit(
                    Provide x, z coordinates for placement (y is calculated
                    automatically from terrain height — do NOT pass y).
                    facing 0-3: 0=South 1=East 2=North 3=West.
-                   IMPORTANT: for build orders where you need completion
-                   tracking, use reserve_and_build() instead — it atomically
-                   reserves the builder, issues the order, and registers the
-                   idle watch in a single call, preventing race conditions.
-                   Use this 'build' command only for factory queue builds
-                   (set_rally) or when you have already reserved the unit.
       set_rally  – set factory rally point to (x, y, z)
 
     Args:
@@ -817,13 +588,9 @@ def find_allied_units(
     IMPORTANT: Always use owner='bot' unless the player explicitly asks you
     to command their own units.
 
-    Returns a compact JSON list. Each entry contains only:
-      unitID, name, x, y, z, health, maxHealth,
-      isCommander, isFactory, isBuilder, canMove, canAttack,
-      isExtractor, isGenerator, teamID, isBot.
-
-    buildOptions are NOT included. Call get_unit_details([unitID]) if you
-    need to inspect a builder's full build options before issuing an order.
+    Returns a JSON list: [{unitID, name, humanName, isCommander, isFactory,
+    isBuilder, canMove, canAttack, isExtractor, isGenerator, x, y, z,
+    health, maxHealth, buildOptions, teamID, isBot}, ...]
     """
     try:
         state = _get("/state")
@@ -860,14 +627,6 @@ def find_allied_units(
             )
         return False  # unknown category
 
-    _SLIM_FIELDS = {
-        "unitID", "name", "humanName",
-        "x", "y", "z",
-        "health", "maxHealth",
-        "isCommander", "isFactory", "isBuilder",
-        "canMove", "canAttack", "isExtractor", "isGenerator",
-    }
-
     result = []
     for team in state.get("teams", []):
         is_bot = team.get("isBot", False)
@@ -881,70 +640,23 @@ def find_allied_units(
                 continue
             if name_filter and name_filter.lower() not in unit.get("name", "").lower():
                 continue
-            slim = {k: v for k, v in unit.items() if k in _SLIM_FIELDS}
-            slim["teamID"] = team["teamID"]
-            slim["isBot"] = is_bot
-            result.append(slim)
-    print(result)
-    # One compact object per line: fewer tokens than indent=2, easier to scan than a single blob
-    lines = [json.dumps(u, separators=(",", ":")) for u in result]
-    return "[\n" + ",\n".join(lines) + "\n]"
-
-
-@tool
-def get_unit_details(unit_ids: list) -> str:
-    """
-    Returns full unit data (including buildOptions) for a specific list of
-    unit IDs. Use this when you need detailed information about particular
-    units — for example, to inspect a builder's full buildOptions list before
-    deciding what to construct.
-
-    find_allied_units() returns a slim summary intentionally; call this tool
-    to get the complete picture for units you have already identified.
-
-    Args:
-        unit_ids: List of integer Spring unit IDs.
-
-    Returns a JSON list with all available fields per unit, including
-    buildOptions as a flat list of defName strings: ["armmex", "armsolar", ...]
-    """
-    try:
-        state = _get("/state")
-    except ConnectionError as e:
-        return f"ERROR: {e}"
-
-    id_set = set(unit_ids)
-    result = []
-    for team in state.get("teams", []):
-        for unit in team.get("units", []):
-            if unit.get("unitID") in id_set:
-                entry = {**unit, "teamID": team["teamID"], "isBot": team.get("isBot", False)}
-                # Normalise buildOptions to flat name strings (same as get_game_state("full"))
-                opts = entry.get("buildOptions")
-                if opts and isinstance(opts[0], dict):
-                    entry["buildOptions"] = [o["name"] for o in opts]
-                result.append(entry)
-    print(f"[get_unit_details] {[u['unitID'] for u in result]}")
-    lines = [json.dumps(u, separators=(",", ":")) for u in result]
-    return "[\n" + ",\n".join(lines) + "\n]"
+            result.append({**unit, "teamID": team["teamID"], "isBot": is_bot})
+    return json.dumps(result, indent=2)
 
 
 @tool
 def get_enemy_intel() -> str:
     """
-    Returns only the enemy units currently visible to the local player
-    (not hidden in fog of war). Includes radar blips (no defName, position
-    only) and fully visible units with position and estimated health.
+    Returns all enemy units currently visible to the local player (not hidden
+    in fog of war). Includes radar blips (blip=true, no defName) and fully
+    visible units with position and estimated health.
 
-    Use this when you ONLY need enemy data — it returns far fewer tokens
-    than get_game_state("units") which also returns all allied unit lists.
-    Typical uses: target acquisition, threat assessment, planning a strike.
+    Use this for target acquisition, threat assessment, or planning strikes.
     """
     try:
         state = _get("/state")
         enemies = state.get("visibleEnemies", [])
-        lines = [json.dumps(e, separators=(",", ":")) for e in enemies]
-        return "[\n" + ",\n".join(lines) + "\n]"
+        return json.dumps(enemies, indent=2)
     except ConnectionError as e:
         return f"ERROR: {e}"
 
@@ -1085,9 +797,9 @@ def reserve_and_build(
     be notified when it finishes.
 
     IMPORTANT: build_type MUST be a defName that appears in the unit's
-    'buildOptions' list. Call get_unit_details([unit_id]) to inspect a
-    builder's options if unsure. This call validates automatically and will
-    return an error listing valid names if build_type is wrong.
+    'buildOptions' list (returned by get_game_state() or find_allied_units()).
+    Always verify with get_game_state() first. If the unit cannot build the
+    requested structure, this call will return an error listing valid names.
 
     This single call guarantees the reservation is in place before the build
     order reaches the game, preventing the native AI from overriding it.
@@ -1228,6 +940,26 @@ def gift_units(unit_ids: list) -> str:
         return f"ERROR: {e}"
 
 
+@tool
+def get_pending_events() -> str:
+    """
+    Poll and drain all pending unit events (idle, finished, destroyed,
+    from_factory) that have been queued by the relay gadget since the last call.
+
+    Returns a JSON list of event objects:
+      {"type": "idle"|"finished"|"destroyed"|"from_factory",
+       "unitID": <n>, "taskID": "<str>", "frame": <n>,
+       "newUnitID": <n>   (only for from_factory events)}
+
+    Returns an empty list if no events are pending.
+    """
+    try:
+        evts = _get("/events")
+        return json.dumps(evts)
+    except ConnectionError as e:
+        return f"ERROR: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Active-task registry  (task_id → context for event-driven continuation)
 # ---------------------------------------------------------------------------
@@ -1236,11 +968,11 @@ activeTasks: dict = {}
 # ---------------------------------------------------------------------------
 # Module-level work queue  (shared by chat-loop thread AND STT callback)
 # ---------------------------------------------------------------------------
-_work_queue:   _queue.PriorityQueue = _queue.PriorityQueue()
-_seq_counter:  int = 0
-_seq_lock:     threading.Lock = threading.Lock()
+_work_queue: _queue.PriorityQueue = _queue.PriorityQueue()
+_seq_counter: int = 0
+_seq_lock: threading.Lock = threading.Lock()
 _queued_tasks: set = set()
-_queued_lock:  threading.Lock = threading.Lock()
+_queued_lock: threading.Lock = threading.Lock()
 
 
 def _next_seq() -> int:
@@ -1248,6 +980,24 @@ def _next_seq() -> int:
     with _seq_lock:
         _seq_counter += 1
         return _seq_counter
+
+
+def _with_pings(msg: str) -> str:
+    """
+    Append any unread player map-pings to msg.
+    Example: "Build a turret here ! [Player pinged (1024, 512)]"
+    """
+    try:
+        pings = _get("/pings")
+        if pings:
+            parts = [f"({p['x']}, {p['z']})" for p in pings]
+            noun = "pinged" if len(parts) == 1 else "pinged"
+            suffix = " [Player " + noun + " " + ", ".join(parts) + "]"
+            print(f"[ping] attaching {len(parts)} ping(s) to message")
+            return msg + suffix
+    except Exception:
+        pass
+    return msg
 
 
 def _enqueue(inp: str, task_id: "str | None", priority: int) -> None:
@@ -1259,16 +1009,18 @@ def _enqueue(inp: str, task_id: "str | None", priority: int) -> None:
                 return
             _queued_tasks.add(task_id)
     _work_queue.put((priority, _next_seq(), inp, task_id))
-    print(f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}")
+    print(
+        f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # STT coroutines  (Voxtral real-time transcription, merged from SpeechToTextDaemon)
 # ---------------------------------------------------------------------------
-_stt_audio_q: asyncio.Queue   # filled by audio_reader, consumed by gated_audio_stream
-_stt_start:   asyncio.Event   # key pressed
-_stt_stop:    asyncio.Event   # key released
-_stt_cancel:  asyncio.Event   # key cancelled
+_stt_audio_q: asyncio.Queue  # filled by audio_reader, consumed by gated_audio_stream
+_stt_start: asyncio.Event  # key pressed
+_stt_stop: asyncio.Event  # key released
+_stt_cancel: asyncio.Event  # key cancelled
 
 
 async def _stt_mic_stream() -> AsyncIterator[bytes]:
@@ -1280,8 +1032,11 @@ async def _stt_mic_stream() -> AsyncIterator[bytes]:
         loop.call_soon_threadsafe(q.put_nowait, bytes(indata))
 
     with _sd.InputStream(
-        samplerate=STT_SAMPLE_RATE, channels=STT_CHANNELS,
-        dtype="int16", blocksize=STT_BLOCK_SIZE, callback=_cb,
+        samplerate=STT_SAMPLE_RATE,
+        channels=STT_CHANNELS,
+        dtype="int16",
+        blocksize=STT_BLOCK_SIZE,
+        callback=_cb,
     ):
         print("[stt] Microphone open via sounddevice.")
         while True:
@@ -1320,8 +1075,11 @@ async def _stt_gated_stream() -> AsyncIterator[bytes]:
     # Discard stale chunks
     drained = 0
     while not _stt_audio_q.empty():
-        try: _stt_audio_q.get_nowait(); drained += 1
-        except asyncio.QueueEmpty: break
+        try:
+            _stt_audio_q.get_nowait()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
     if drained:
         print(f"[stt] Drained {drained} stale audio chunk(s).")
 
@@ -1340,14 +1098,18 @@ async def _stt_gated_stream() -> AsyncIterator[bytes]:
             _stt_stop.clear()
             yield chunk
             while not _stt_audio_q.empty():
-                try: _stt_audio_q.get_nowait()
-                except asyncio.QueueEmpty: break
+                try:
+                    _stt_audio_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             return
         if _stt_cancel.is_set():
             _stt_cancel.clear()
             while not _stt_audio_q.empty():
-                try: _stt_audio_q.get_nowait()
-                except asyncio.QueueEmpty: break
+                try:
+                    _stt_audio_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             print("[stt] Cancelled.")
             return
         yield chunk
@@ -1411,9 +1173,10 @@ async def _stt_session_loop() -> None:
             if text:
                 # Write result for Lua widget HUD display (no chat send needed)
                 STT_RESULT_FILE.write_text(text, encoding="utf-8")
-                print(f"[stt] Routing to agent: {text!r}")
+                enriched = _with_pings(text)
+                print(f"[stt] Routing to agent: {enriched!r}")
                 # Directly enqueue — no game-chat round-trip
-                _enqueue(f"[Voice] {text}", task_id=None, priority=0)
+                _enqueue(f"[Voice] {enriched}", task_id=None, priority=0)
             else:
                 print("[stt] Empty transcription.")
             # Write done flag so Lua widget resets its UI to idle
@@ -1447,29 +1210,53 @@ def _run_stt_loop() -> None:
     global _stt_audio_q, _stt_start, _stt_stop, _stt_cancel
 
     # Clean stale flag files from previous runs
-    for f in [STT_TRIGGER_FILE, STT_STOP_FILE, STT_CANCEL_FILE,
-              STT_DONE_FILE, STT_RESULT_FILE]:
+    for f in [
+        STT_TRIGGER_FILE,
+        STT_STOP_FILE,
+        STT_CANCEL_FILE,
+        STT_DONE_FILE,
+        STT_RESULT_FILE,
+    ]:
         f.unlink(missing_ok=True)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _stt_audio_q = asyncio.Queue()
-    _stt_start   = asyncio.Event()
-    _stt_stop    = asyncio.Event()
-    _stt_cancel  = asyncio.Event()
+    _stt_start = asyncio.Event()
+    _stt_stop = asyncio.Event()
+    _stt_cancel = asyncio.Event()
 
     print(f"[stt] STT thread started. IPC dir: {_IPC_DIR}")
-    print(f"[stt] Mic mode: {'sounddevice' if _sd_available else 'stdin (ffmpeg pipe)'}")
+    print(
+        f"[stt] Mic mode: {'sounddevice' if _sd_available else 'stdin (ffmpeg pipe)'}"
+    )
     try:
-        loop.run_until_complete(asyncio.gather(
-            _stt_audio_reader(),
-            _stt_session_loop(),
-            _stt_trigger_loop(),
-        ))
+        loop.run_until_complete(
+            asyncio.gather(
+                _stt_audio_reader(),
+                _stt_session_loop(),
+                _stt_trigger_loop(),
+            )
+        )
     except Exception as exc:
         print(f"[stt] Fatal error in STT loop: {exc}")
     finally:
         loop.close()
+
+
+last_exec = None
+
+
+def time_since_last_execution():
+    global last_exec
+    now = time.time()
+    if last_exec is None:
+        last_exec = now
+        return None
+    elapsed = now - last_exec
+    last_exec = now
+    # format elapsed as human-readable string
+    return str(datetime.timedelta(seconds=elapsed))
 
 
 # ---------------------------------------------------------------------------
@@ -1489,43 +1276,12 @@ Game basics:
 - Constructors (con) can build structures anywhere on the map.
 - Each game frame = 1/30 second. A frame value of 9000 ≈ 5 minutes in.
 
-Unit data schema — fields you will see in tool responses:
-- unitID   : integer — the LIVE instance ID. Use this in all commands (command_unit,
-             reserve_units, watch_unit, etc.). Unique per game session.
-- name     : string — the unit TYPE defName (e.g. 'armcom', 'armbeaver', 'armmex').
-             This is also what you pass as unit_type in build orders.
-- defID    : integer — internal engine type index. You will never need to pass this
-             to any tool; ignore it.
-- isCommander / isFactory / isBuilder / canMove / canAttack / isExtractor / isGenerator:
-             boolean flags describing the unit's role and capabilities.
-- health / maxHealth : current and maximum hit-points.
-- x, y, z  : world-space position. x = east-west, z = north-south, y = altitude.
-             Build orders use x and z only (y is terrain height, auto-calculated).
-- buildOptions : list of defNames this unit is allowed to build. Only present on
-             builders and factories. ALWAYS pick a name from this list when issuing
-             a build order — using any other name will silently fail or error.
-- teamID   : which team owns this unit.
-- isBot / isMyTeam : whether the owning team is the AI or the human player.
-
 Your role:
 - You watch in-game chat and respond when a player addresses you with
   "@agent" or starts a message with "!".
 - You can read the game state, issue unit orders, queue factory production,
   send chat replies, and coordinate multi-unit actions.
-MANDATORY state-awareness rules — follow these on EVERY invocation:
-1. ALWAYS call get_game_frame() first, before anything else.
-2. If no get_game_state() result exists in your conversation history, call
-   get_game_state() immediately ("summary" mode is cheapest).
-3. If the frame returned by get_game_frame() is more than 300 frames ahead
-   of the frame in your last get_game_state() response (~10 s), your cached
-   state is STALE — call get_game_state() before answering or issuing orders.
-4. If the player is asking for information about the game (resources, units,
-   map, enemies, etc.), ALWAYS call get_game_state() regardless of staleness.
-5. If you are about to issue a command (build, attack, move…), ALWAYS call
-   get_game_state() first if your state is stale (rule 3) OR if you do not
-   already have the relevant unit IDs in your context.
-6. Use get_game_state("units") only when you need positions/IDs across teams.
-   Prefer find_allied_units() to locate specific bot units to command.
+- Always call get_game_state before taking any action so you have up-to-date info.
 - ALWAYS use send_chat_message() to communicate with the player. It is the ONLY
   way your messages appear in-game. Your text response is NOT shown to the player.
 - Use map_ping(x, z, label) to highlight important locations on the map — threats,
@@ -1588,32 +1344,24 @@ Multi-step tasks with unit reservation:
 """
 
 BAR_TOOLS = [
-    # ── State queries ──────────────────────────────────────────────────────
-    get_game_frame,       # current frame only — mandatory staleness check
-    get_game_state,       # quick summary / slim unit list / full unit list
-    get_build_catalog,    # all unit defs grouped by category
-    find_allied_units,    # category-filtered allied unit search
-    get_unit_details,     # full data (incl. buildOptions) for specific unit IDs
-    get_enemy_intel,      # visible enemies only (token-efficient subset of state)
-    get_build_queue,      # pending orders for factories / constructors
-    # ── Communication ──────────────────────────────────────────────────────
-    send_chat_message,    # broadcast in-game + TTS — ONLY way to talk to the player
-    map_ping,             # place a visible map marker
-    # ── Unit commands ──────────────────────────────────────────────────────
-    command_unit,         # single order (move/attack/patrol/fight/stop/reclaim/repair/guard/set_rally)
-    command_units_batch,  # convenience wrapper: multiple command_unit calls in one tool call
-    # ── Reservation & event watching ───────────────────────────────────────
-    reserve_units,        # lock unit(s) so native AI cannot override
-    unreserve_units,      # release lock when task is done or failed
-    watch_unit,           # register event listener (idle/finished/from_factory/destroyed)
-    unwatch_unit,         # cancel a previously registered watch
-    reserve_and_build,    # atomic: reserve + build order + watch idle (preferred for builds)
-    # ── Unit transfer ──────────────────────────────────────────────────────
-    gift_units,           # transfer bot-owned units to the human player
+    get_game_state,
+    get_build_catalog,
+    get_new_chat_messages,
+    send_chat_message,
+    command_unit,
+    command_units_batch,
+    find_allied_units,
+    get_enemy_intel,
+    reserve_units,
+    unreserve_units,
+    watch_unit,
+    unwatch_unit,
+    get_pending_events,
+    reserve_and_build,
+    map_ping,
+    gift_units,
+    get_build_queue,
 ]
-# NOTE: get_new_chat_messages is intentionally excluded from BAR_TOOLS.
-# The agent loop (run_chat_loop) already routes chat messages to the LLM as
-# new invocations — the LLM must never poll it directly.
 
 
 def build_agent() -> Agent:
@@ -1641,7 +1389,8 @@ def build_agent() -> Agent:
     return Agent(
         model=model,
         tools=BAR_TOOLS,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT
+        + f"\n [LAST EXECUTION] \n {time_since_last_execution()} ago.",
         callback_handler=_cb,
     )
 
@@ -1761,7 +1510,7 @@ def run_chat_loop(agent: Agent) -> None:
             if text.startswith("[AgentBridge"):
                 continue
             if _should_route(text):
-                user_input = _strip_prefix(text)
+                user_input = _with_pings(_strip_prefix(text))
                 print(f"[→ agent] routing: {user_input!r}")
                 _enqueue(user_input, task_id=None, priority=0)
             else:
@@ -1815,9 +1564,7 @@ def main() -> None:
     agent = build_agent()
 
     # Start the STT daemon thread (voice → Voxtral → agent queue, no chat hop)
-    stt_thread = threading.Thread(
-        target=_run_stt_loop, daemon=True, name="stt-daemon"
-    )
+    stt_thread = threading.Thread(target=_run_stt_loop, daemon=True, name="stt-daemon")
     stt_thread.start()
     print("[main] STT daemon thread started.")
 

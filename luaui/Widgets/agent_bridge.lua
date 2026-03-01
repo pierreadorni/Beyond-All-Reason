@@ -219,6 +219,8 @@ local peekBuffer          = {}   -- last 20 messages ever pushed (never drained)
 local outgoingChat        = {}   -- queued messages to send as in-game chat
 local eventsBuffer        = {}   -- unit events from gadget (drained by GET /events)
 local pendingPings        = {}   -- map markers queued for Spring.MarkerAddPoint (flushed in widget:Update)
+local recentPings         = {}   -- player map-pings (drained by GET /pings)
+local PING_TTL            = 20   -- seconds before a ping is discarded if not consumed
 local EVT_PREFIX          = "AGENTBRIDGE_EVT:"
 local EVT_PREFIX_LEN      = #EVT_PREFIX
 local defsCatalog         = nil  -- built once on Initialize
@@ -634,6 +636,18 @@ local function handleRequest(method, path, body)
 		spEcho("[AgentBridge] gift " .. #unitIDs .. " unit(s) to team " .. toTeamID)
 		return jsonOk({ status = "ok", toTeamID = toTeamID, count = #unitIDs })
 
+	-- GET /pings  (drain player map-pings, max PING_TTL seconds old)
+	elseif path == "/pings" and method == "GET" then
+		local now  = Spring.GetGameSeconds()
+		local fresh = {}
+		for _, p in ipairs(recentPings) do
+			if (now - p.t) <= PING_TTL then
+				fresh[#fresh+1] = p
+			end
+		end
+		recentPings = {}
+		return jsonOk(fresh)
+
 	else
 		return buildHttpResponse(404, "Not Found", Json.encode({ error = "Not found" }))
 	end
@@ -659,6 +673,20 @@ local function pushChat(text)
 	-- Keep a permanent peek buffer (last 20, never drained by /chat)
 	if #peekBuffer >= 20 then table.remove(peekBuffer, 1) end
 	peekBuffer[#peekBuffer+1] = { text = text, frame = spGameFrame() }
+end
+
+-- Capture local-player map pings (point draws) for the AI
+-- MapDrawCmd fires for every map draw: type 0/"point" = ping, 2/"line" = line, 1/"erase"
+function widget:MapDrawCmd(playerID, cmdType, px, py, pz, label)
+	if cmdType ~= "point" and cmdType ~= 0 then return end
+	if playerID ~= Spring.GetMyPlayerID() then return end
+	recentPings[#recentPings+1] = {
+		x = math.floor(px),
+		y = math.floor(py),
+		z = math.floor(pz),
+		t = Spring.GetGameSeconds(),
+	}
+	Spring.Echo("[AgentBridge] Ping captured at (" .. math.floor(px) .. ", " .. math.floor(pz) .. ")")
 end
 
 -- Primary callin: player chat messages (all/ally/spec channels)
