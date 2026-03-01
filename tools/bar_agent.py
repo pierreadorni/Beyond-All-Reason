@@ -476,9 +476,14 @@ def command_unit(
 
     Movement & combat:
       move    – move unit to (x, y, z)
-      attack  – attack target_id (unit), or attack ground at (x, y, z)
+      attack  – attack a specific enemy unit by target_id (ALWAYS use this
+                form to attack a unit from visibleEnemies — pass target_id=
+                the enemy unitID, NOT coordinates; coordinates shoot at the
+                ground and the unit will miss a moving target)
+      fight   – fight/attack-move to (x, y, z): advance while auto-engaging
+                any enemies in range; use this for area assaults or when
+                sending units toward an enemy base
       patrol  – patrol to (x, y, z)
-      fight   – fight-move to (x, y, z) (attack-move)
       stop    – cancel all orders
       selfd   – self-destruct
 
@@ -834,12 +839,47 @@ def reserve_and_build(
                     f"Use one of those names instead."
                 )
         else:
-            print(
-                f"[reserve_and_build] WARNING: unit {unit_id} not found in state, skipping validation"
+            return (
+                f"ERROR: unit {unit_id} not found in the current game state — "
+                f"it may have been destroyed. Call find_allied_units() to get "
+                f"a fresh list of available units."
             )
     except Exception as e:
         print(
             f"[reserve_and_build] WARNING: validation failed ({e}), proceeding anyway"
+        )
+    # ──────────────────────────────────────────────────────────────────────────
+    # Snap to closest valid build site so we don't silently fail on a blocked spot
+    # ──────────────────────────────────────────────────────────────────────────
+    actual_x, actual_z = x, z
+    try:
+        site = _post(
+            "/buildsite",
+            {
+                "defName": build_type,
+                "x": x,
+                "z": z,
+                "facing": facing,
+                "searchRadius": 300,
+            },
+        )
+        if site.get("found"):
+            actual_x = site["x"]
+            actual_z = site["z"]
+            moved = abs(actual_x - x) > 4 or abs(actual_z - z) > 4
+            if moved:
+                print(
+                    f"[reserve_and_build] snapped ({x},{z}) → ({actual_x},{actual_z})"
+                )
+        else:
+            _post("/unreserve", {"unitIDs": [unit_id]})
+            return (
+                f"ERROR: no valid build site found for '{build_type}' within 300 units "
+                f"of ({x}, {z}). Choose a different location."
+            )
+    except Exception as e:
+        print(
+            f"[reserve_and_build] buildsite check failed ({e}), using original coords"
         )
     # ──────────────────────────────────────────────────────────────────────────
     steps = []
@@ -854,8 +894,8 @@ def reserve_and_build(
             "unitID": unit_id,
             "cmd": "build",
             "shift": False,
-            "x": x,
-            "z": z,
+            "x": actual_x,
+            "z": actual_z,
             "facing": facing,
             "unitType": build_type,
         }
@@ -877,7 +917,15 @@ def reserve_and_build(
         print(f"[reserve_and_build] watching {unit_id} idle for task {task_id!r}")
     except (ConnectionError, RuntimeError) as e:
         return f"WARNING: build ordered but watch failed: {e}"
-    return json.dumps({"status": "ok", "steps": steps})
+    return json.dumps(
+        {
+            "status": "ok",
+            "x": actual_x,
+            "z": actual_z,
+            "snapped": (actual_x != x or actual_z != z),
+            "steps": steps,
+        }
+    )
 
 
 @tool
@@ -1378,13 +1426,20 @@ def build_agent() -> Agent:
         """Log every tool invocation so we can see what the LLM decides to call."""
         if "current_tool_use" in kwargs:
             tu = kwargs["current_tool_use"]
-            name = tu.get("name", "?")
+            # current_tool_use fires on every streaming chunk of the input JSON.
+            # Only print once the input is fully assembled (input is a dict, not
+            # a partial string) and the tool_use id has not been logged yet.
+            tool_id = tu.get("toolUseId") or tu.get("id", "")
             inp = tu.get("input", {})
-            # Print on its own line even if a streaming chunk left no newline
-            print(f"\n[tool_call] {name}({inp})")
+            if isinstance(inp, dict) and tool_id and tool_id not in _cb.seen_ids:
+                _cb.seen_ids.add(tool_id)
+                name = tu.get("name", "?")
+                print(f"\n[tool_call] {name}({inp})")
         # Also stream text chunks to stdout so we can follow reasoning
         elif "data" in kwargs and isinstance(kwargs["data"], str):
             print(kwargs["data"], end="", flush=True)
+
+    _cb.seen_ids: set = set()
 
     return Agent(
         model=model,

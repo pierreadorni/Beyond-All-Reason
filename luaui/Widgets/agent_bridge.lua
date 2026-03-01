@@ -555,6 +555,31 @@ local function handleRequest(method, path, body)
 		outgoingChat[#outgoingChat+1] = msg
 		return jsonOk({ status = "queued" })
 
+	-- POST /buildsite  {"defName":"<name>", "x":<n>, "z":<n>, "facing":<0-3>, "searchRadius":<n>}
+	-- Returns the closest valid build position for the given unit type near (x, z).
+	-- Uses Spring.ClosestBuildPos internally.
+	elseif path == "/buildsite" and method == "POST" then
+		if not body or body == "" then return jsonError("Empty body") end
+		local ok, data = pcall(Json.decode, body)
+		if not ok or type(data) ~= "table" then return jsonError("Invalid JSON") end
+		local defName = data.defName
+		if not defName then return jsonError("Missing defName") end
+		local ud = UnitDefNames[defName]
+		if not ud then return jsonError("Unknown defName: " .. tostring(defName)) end
+		local x       = tonumber(data.x) or 0
+		local z       = tonumber(data.z) or 0
+		local facing  = tonumber(data.facing) or 0
+		local radius  = tonumber(data.searchRadius) or 300
+		local y       = Spring.GetGroundHeight(x, z) or 0
+		local teamID  = Spring.GetMyTeamID()
+		local bx, by, bz = Spring.ClosestBuildPos(teamID, ud.id, x, y, z, radius, 2, facing)
+		-- ClosestBuildPos returns the snapped position; validate it's actually buildable
+		local status = bx and Spring.TestBuildOrder(ud.id, bx, by or 0, bz, facing) or 0
+		if not bx or status == 0 then
+			return jsonOk({ found = false, x = x, z = z })
+		end
+		return jsonOk({ found = true, x = math.floor(bx), z = math.floor(bz) })
+
 	-- POST /command
 	elseif path == "/command" and method == "POST" then
 		if not body or body == "" then return jsonError("Empty body") end

@@ -39,12 +39,14 @@ local SHAKE_IMPULSE   = 3.5           -- max pixel impulse per frame at amplitud
 local SHAKE_DECAY     = 12.0          -- exponential decay rate (larger = snappier)
 local SHAKE_MAX       = 8.0           -- hard clamp on shake offset (pixels)
 local AUTO_TIMEOUT    = 45.0          -- safety: auto-hide after this many seconds
-local LABEL_TEXT      = "Ally Commander"
+local LABEL_TEXT      = "Mistral Commander"
 local LABEL_FONT_SIZE = 13
+local LOGO_PAD        = 3             -- padding around logo inside the strip
 
 -- Texture paths (VFS-relative; note the typo in the second file name is intentional)
 local TEX_ATTACK = "bitmaps/ui/ally_commander_1.png"  -- attack / aggressive pose
 local TEX_CALM   = "bitmaps/ui/aly_commander_2.png"   -- calm / at-ease pose
+local TEX_LOGO   = "bitmaps/ui/mistral_logo.png"      -- Mistral logo shown in the nametag
 
 --------------------------------------------------------------------------------
 -- State
@@ -158,10 +160,18 @@ function widget:DrawScreen()
 	-- ── Label ──────────────────────────────────────────────────────────────
 	if alpha > 0.3 then
 		-- Background strip behind the label
-		local labelH = LABEL_FONT_SIZE + 6
+		local labelH   = LABEL_FONT_SIZE + 6
+		local logoSize = labelH - LOGO_PAD * 2   -- square logo fitting inside the strip
 		gl.Color(0.0, 0.0, 0.0, alpha * 0.70)
 		gl.Rect(x1, y1, x2, y1 + labelH)
 
+		-- Mistral logo (left side of strip)
+		gl.Color(1.0, 1.0, 1.0, alpha)
+		gl.Texture(TEX_LOGO)
+		gl.TexRect(x1 + LOGO_PAD, y1 + LOGO_PAD, x1 + LOGO_PAD + logoSize, y1 + LOGO_PAD + logoSize)
+		gl.Texture(false)
+
+		-- Label text (centred in the full strip width as before)
 		gl.Color(0.70, 1.00, 0.75, alpha)
 		gl.Text(LABEL_TEXT, x1 + PORTRAIT_W * 0.5, y1 + 4, LABEL_FONT_SIZE, "oc")
 	end

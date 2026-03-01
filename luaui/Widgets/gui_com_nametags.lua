@@ -84,6 +84,7 @@ local showPlayerRank = false
 local showSkillValue = true
 local playerRankSize = fontSize * 1.05
 local playerRankImages = "luaui\\images\\advplayerslist\\ranks\\"
+local mistralLogoTex = "bitmaps/ui/mistral_logo.png"
 
 --------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -179,6 +180,7 @@ local function GetCommAttributes(unitID, unitDefID)
 		return nil
 	end
 
+	local isAI = false
 	local playerRank
 	local name = ''
 	local luaAI = spGetTeamLuaAI(team)
@@ -197,6 +199,7 @@ local function GetCommAttributes(unitID, unitDefID)
 		else
 			name = Spring.I18N('ui.playersList.aiName', { name = spGetGameRulesParam('ainame_' .. team) })
 		end
+		isAI = true
 
 	else
 		local unitDefCustomParams = UnitDefs[unitDefID].customParams
@@ -254,7 +257,7 @@ local function GetCommAttributes(unitID, unitDefID)
 
 	local xp = 0
 	local height = comHeight[unitDefID] + heightOffset
-	return { name, { r, g, b, a }, height, bgColor, nil, playerRank and playerRank+1, xp, skill}
+	return { name, { r, g, b, a }, height, bgColor, nil, playerRank and playerRank+1, xp, skill, isAI}
 end
 
 local function RemoveLists()
@@ -283,6 +286,7 @@ local function createComnameList(attributes)
 			outlineColor = { 1, 1, 1, 1 }		-- try to keep these values the same as the playerlist
 		end
 		local name = attributes[1]
+		name = "Mistral Commander"
 		if anonymousMode ~= "disabled" and not spec then
 			name = anonymousName
 		end
@@ -325,6 +329,18 @@ local function createComnameList(attributes)
 				font:Print(attributes[8], x_l-(playerRankSize*0.86), y_l-(playerRankSize*0.29), playerRankSize*0.66, "con")
 				font:End()
 			end
+		end
+
+		-- Mistral logo (left side of name, for AI commanders)
+		if attributes[9] then
+			local textHalfW = (font:GetTextWidth(name) * fontSize) * 0.5
+			local logoH     = fontSize * 1.56
+			local logoPad   = fontSize * 0.12
+			local lx        = -(textHalfW + logoPad + logoH)
+			local ly        = -logoH * 0.3
+			glTexture(mistralLogoTex)
+			glTexRect(lx, ly, lx + logoH, ly + logoH)
+			glTexture(false)
 		end
 	end)
 end
@@ -507,6 +523,7 @@ local function createComnameIconList(unitID, attributes)
 				outlineColor = { 1, 1, 1, 1 }
 			end
 			local name = attributes[1]
+			name = "Mistral Commander"
 			if anonymousMode ~= "disabled" and (not spec) then
 				name = anonymousName
 			end
@@ -515,6 +532,18 @@ local function createComnameIconList(unitID, attributes)
 			fonticon:SetOutlineColor(outlineColor)
 			fonticon:Print(name, 0, 0, fontSize * 1.9, "con")
 			fonticon:End()
+			-- Mistral logo (left side of name, for AI commanders)
+			if attributes[9] then
+				local iconFontSize = fontSize * 3
+				local textHalfW    = fonticon:GetTextWidth(name) * iconFontSize * 0.32
+				local logoH        = iconFontSize * 0.82
+				local logoPad      = iconFontSize * 0.06
+				local lx           = -(textHalfW + logoPad + logoH)
+				local ly           = -logoH * 0.2
+				glTexture(mistralLogoTex)
+				glTexRect(lx, ly, lx + logoH, ly + logoH)
+				glTexture(false)
+			end
 		end
 	end)
 end

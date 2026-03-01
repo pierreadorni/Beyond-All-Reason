@@ -272,10 +272,18 @@ local VERB_MAP = {
 	selfd   = { cmdID = CMD.SELFD,   params = function(_) return {} end },
 	stop    = { cmdID = CMD.STOP,    params = function(_) return {} end },
 	move    = { cmdID = CMD.MOVE,    params = function(c) return { c.x or 0, c.y or 0, c.z or 0 } end },
-	attack  = { cmdID = CMD.ATTACK,  params = function(c)
-		if c.targetID then return { c.targetID }
-		else return { c.x or 0, c.y or 0, c.z or 0 } end
-	end },
+	attack  = {
+		-- With a targetID: true unit-targeting attack (tracks the unit).
+		-- With coordinates only: use CMD.FIGHT (attack-move) so units advance
+		-- while auto-engaging enemies in the area instead of shooting at the ground.
+		params = function(c)
+			if c.targetID then return { c.targetID }
+			else return { c.x or 0, c.y or 0, c.z or 0 } end
+		end,
+		cmdID = function(c)
+			if c.targetID then return CMD.ATTACK else return CMD.FIGHT end
+		end,
+	},
 	patrol  = { cmdID = CMD.PATROL,  params = function(c) return { c.x or 0, c.y or 0, c.z or 0 } end },
 	fight   = { cmdID = CMD.FIGHT,   params = function(c) return { c.x or 0, c.y or 0, c.z or 0 } end },
 	reclaim = { cmdID = CMD.RECLAIM, params = function(c)
@@ -377,7 +385,9 @@ local function dispatchCommand(senderTeamID, cmd)
 		return
 	end
 
-	spGiveOrderToUnit(unitID, entry.cmdID, params, opts)
+	-- cmdID may be a plain value or a function(cmd) for context-dependent commands
+	local cmdID = type(entry.cmdID) == "function" and entry.cmdID(cmd) or entry.cmdID
+	spGiveOrderToUnit(unitID, cmdID, params, opts)
 	_agentOrderInProgress = false
 end
 
