@@ -304,21 +304,128 @@ def _post(path: str, body: dict) -> dict:
 
 
 @tool
-def get_game_state() -> str:
+def get_game_state(mode: str = "summary") -> str:
     """
-    Returns full current game state as JSON, including:
-    - allyTeams: list of teams with their units (id, defName, position,
-      health, category, buildOptions for factories)
-    - visibleEnemies: enemy units currently visible on the map
-    - mapInfo: map name, dimensions, wind speed, tidal strength
-    - gameFrame: current simulation frame (30 fps)
+    Returns current global game state. Choose mode based on what you need:
 
-    Call this to understand the overall battlefield situation before
-    planning any actions.
+    "summary" (default) — frame, mapInfo, per-team resources (metal/energy
+      income/expense/storage) and unit COUNTS per category. No individual
+      units. Use this for quick situational awareness before deciding what
+      to do. Cheapest call.
+
+    "units" — frame, mapInfo, per-team resources + slim unit list per team
+      (unitID, name, x/y/z, health/maxHealth, boolean flags). No buildOptions.
+      Use when you need unit positions or IDs across all teams.
+
+    "full" — same as "units" but also includes each unit's buildOptions name
+      list. Use only when you need to check build options for multiple units
+      at once; prefer get_unit_details([id]) for a single unit.
+
+    Args:
+        mode: One of "summary" (default), "units", "full".
+    """
+    _UNIT_SLIM = {
+        "unitID", "name", "x", "y", "z", "health", "maxHealth",
+        "isCommander", "isFactory", "isBuilder",
+        "canMove", "canAttack", "isExtractor", "isGenerator",
+    }
+
+    def _categorise(unit: dict) -> str:
+        is_cmd  = unit.get("isCommander", False)
+        is_fact = unit.get("isFactory",   False)
+        is_bld  = unit.get("isBuilder",   False)
+        can_mv  = unit.get("canMove",     False)
+        can_atk = unit.get("canAttack",   False)
+        is_ext  = unit.get("isExtractor", False)
+        is_gen  = unit.get("isGenerator", False)
+        if is_cmd:                                    return "commander"
+        if is_fact:                                   return "factory"
+        if is_bld and can_mv:                         return "constructor"
+        if can_mv and can_atk and not is_bld:         return "combat"
+        if not can_mv and can_atk and not is_fact:    return "defense"
+        if is_ext:                                    return "extractor"
+        if is_gen:                                    return "generator"
+        return "other"
+
+    try:
+        state = _get("/state")
+    except ConnectionError as e:
+        return f"ERROR: {e}"
+
+    _RESOURCE_KEYS = (
+        "teamID", "isBot", "isMyTeam", "luaAI",
+        "metal", "metalIncome", "metalExpense", "metalStorage",
+        "energy", "energyIncome", "energyExpense", "energyStorage",
+    )
+
+    teams_out = []
+    for team in state.get("teams", []):
+        entry = {k: team[k] for k in _RESOURCE_KEYS if k in team}
+        units = team.get("units", [])
+
+        if mode == "summary":
+            counts: dict = {}
+            for u in units:
+                cat = _categorise(u)
+                counts[cat] = counts.get(cat, 0) + 1
+            entry["unitCounts"] = counts
+
+        elif mode == "units":
+            entry["units"] = [
+                {k: v for k, v in u.items() if k in _UNIT_SLIM}
+                for u in units
+            ]
+
+        else:  # "full"
+            def _slim_full(u: dict) -> dict:
+                out = {k: v for k, v in u.items() if k in _UNIT_SLIM}
+                opts = u.get("buildOptions")
+                if opts:
+                    out["buildOptions"] = [o["name"] for o in opts]
+                return out
+            entry["units"] = [_slim_full(u) for u in units]
+
+        teams_out.append(entry)
+
+    out: dict = {
+        "frame": state.get("frame"),
+        "mapInfo": state.get("mapInfo"),
+        "teams": teams_out,
+    }
+    if mode == "summary":
+        out["visibleEnemyCount"] = len(state.get("visibleEnemies", []))
+    else:
+        out["visibleEnemies"] = state.get("visibleEnemies", [])
+
+    result = json.dumps(out, separators=(",", ":"))
+    print(f"[get_game_state] mode={mode!r} \n {result}")
+    return result
+
+
+@tool
+def get_game_frame() -> str:
+    """
+    Returns the current game frame number only. This is an extremely cheap call.
+
+    MANDATORY — call this at the very start of EVERY response, before anything else.
+    Use the returned frame to decide whether your cached state is stale:
+
+      • No prior get_game_state() in this conversation
+            → call get_game_state() immediately after.
+      • Current frame is more than 300 frames ahead of the frame in your last
+        get_game_state() response  (300 frames ≈ 10 seconds at 30 fps)
+            → state is STALE.  Call get_game_state() before answering or acting.
+      • Frame delta ≤ 300
+            → state is fresh enough.  You may skip get_game_state() and act on
+               cached data.
+
+    BAR runs at 30 frames/second.  Frame 9000 ≈ 5 minutes into the game.
     """
     try:
         state = _get("/state")
-        return json.dumps(state, indent=2)
+        frame = state.get("frame", -1)
+        print(f"[get_game_frame] frame={frame}")
+        return json.dumps({"frame": frame})
     except ConnectionError as e:
         return f"ERROR: {e}"
 
@@ -343,12 +450,15 @@ def get_build_catalog() -> str:
 @tool
 def get_new_chat_messages() -> str:
     """
-    Drains and returns all chat messages that have arrived since the last
-    call. Returns a JSON list of objects: [{text, frame}, ...].
-    'text' is the raw console line (e.g. '[All] PlayerName: hello').
-    'frame' is the game frame when it was received.
+    INTERNAL — used by the agent polling loop (run_chat_loop), NOT by the LLM.
 
-    Returns an empty list if no new messages are available.
+    The loop polls /chat automatically and routes each player message as a new
+    agent invocation.  The LLM should never call this tool directly — doing so
+    would produce an empty list (the loop already drained the queue) and risks
+    confusing the control flow.
+
+    Drains and returns all chat messages that have arrived since the last call.
+    Returns a JSON list of objects: [{text, frame}, ...].
     """
     try:
         msgs = _get("/chat")
@@ -448,6 +558,12 @@ def command_unit(
                    Provide x, z coordinates for placement (y is calculated
                    automatically from terrain height — do NOT pass y).
                    facing 0-3: 0=South 1=East 2=North 3=West.
+                   IMPORTANT: for build orders where you need completion
+                   tracking, use reserve_and_build() instead — it atomically
+                   reserves the builder, issues the order, and registers the
+                   idle watch in a single call, preventing race conditions.
+                   Use this 'build' command only for factory queue builds
+                   (set_rally) or when you have already reserved the unit.
       set_rally  – set factory rally point to (x, y, z)
 
     Args:
@@ -544,9 +660,13 @@ def find_allied_units(
     IMPORTANT: Always use owner='bot' unless the player explicitly asks you
     to command their own units.
 
-    Returns a JSON list: [{unitID, name, humanName, isCommander, isFactory,
-    isBuilder, canMove, canAttack, isExtractor, isGenerator, x, y, z,
-    health, maxHealth, buildOptions, teamID, isBot}, ...]
+    Returns a compact JSON list. Each entry contains only:
+      unitID, name, x, y, z, health, maxHealth,
+      isCommander, isFactory, isBuilder, canMove, canAttack,
+      isExtractor, isGenerator, teamID, isBot.
+
+    buildOptions are NOT included. Call get_unit_details([unitID]) if you
+    need to inspect a builder's full build options before issuing an order.
     """
     try:
         state = _get("/state")
@@ -583,6 +703,14 @@ def find_allied_units(
             )
         return False  # unknown category
 
+    _SLIM_FIELDS = {
+        "unitID", "name", "humanName",
+        "x", "y", "z",
+        "health", "maxHealth",
+        "isCommander", "isFactory", "isBuilder",
+        "canMove", "canAttack", "isExtractor", "isGenerator",
+    }
+
     result = []
     for team in state.get("teams", []):
         is_bot = team.get("isBot", False)
@@ -596,23 +724,70 @@ def find_allied_units(
                 continue
             if name_filter and name_filter.lower() not in unit.get("name", "").lower():
                 continue
-            result.append({**unit, "teamID": team["teamID"], "isBot": is_bot})
-    return json.dumps(result, indent=2)
+            slim = {k: v for k, v in unit.items() if k in _SLIM_FIELDS}
+            slim["teamID"] = team["teamID"]
+            slim["isBot"] = is_bot
+            result.append(slim)
+    print(result)
+    # One compact object per line: fewer tokens than indent=2, easier to scan than a single blob
+    lines = [json.dumps(u, separators=(",", ":")) for u in result]
+    return "[\n" + ",\n".join(lines) + "\n]"
+
+
+@tool
+def get_unit_details(unit_ids: list) -> str:
+    """
+    Returns full unit data (including buildOptions) for a specific list of
+    unit IDs. Use this when you need detailed information about particular
+    units — for example, to inspect a builder's full buildOptions list before
+    deciding what to construct.
+
+    find_allied_units() returns a slim summary intentionally; call this tool
+    to get the complete picture for units you have already identified.
+
+    Args:
+        unit_ids: List of integer Spring unit IDs.
+
+    Returns a JSON list with all available fields per unit, including
+    buildOptions as a flat list of defName strings: ["armmex", "armsolar", ...]
+    """
+    try:
+        state = _get("/state")
+    except ConnectionError as e:
+        return f"ERROR: {e}"
+
+    id_set = set(unit_ids)
+    result = []
+    for team in state.get("teams", []):
+        for unit in team.get("units", []):
+            if unit.get("unitID") in id_set:
+                entry = {**unit, "teamID": team["teamID"], "isBot": team.get("isBot", False)}
+                # Normalise buildOptions to flat name strings (same as get_game_state("full"))
+                opts = entry.get("buildOptions")
+                if opts and isinstance(opts[0], dict):
+                    entry["buildOptions"] = [o["name"] for o in opts]
+                result.append(entry)
+    print(f"[get_unit_details] {[u['unitID'] for u in result]}")
+    lines = [json.dumps(u, separators=(",", ":")) for u in result]
+    return "[\n" + ",\n".join(lines) + "\n]"
 
 
 @tool
 def get_enemy_intel() -> str:
     """
-    Returns all enemy units currently visible to the local player (not hidden
-    in fog of war). Includes radar blips (blip=true, no defName) and fully
-    visible units with position and estimated health.
+    Returns only the enemy units currently visible to the local player
+    (not hidden in fog of war). Includes radar blips (no defName, position
+    only) and fully visible units with position and estimated health.
 
-    Use this for target acquisition, threat assessment, or planning strikes.
+    Use this when you ONLY need enemy data — it returns far fewer tokens
+    than get_game_state("units") which also returns all allied unit lists.
+    Typical uses: target acquisition, threat assessment, planning a strike.
     """
     try:
         state = _get("/state")
         enemies = state.get("visibleEnemies", [])
-        return json.dumps(enemies, indent=2)
+        lines = [json.dumps(e, separators=(",", ":")) for e in enemies]
+        return "[\n" + ",\n".join(lines) + "\n]"
     except ConnectionError as e:
         return f"ERROR: {e}"
 
@@ -753,9 +928,9 @@ def reserve_and_build(
     be notified when it finishes.
 
     IMPORTANT: build_type MUST be a defName that appears in the unit's
-    'buildOptions' list (returned by get_game_state() or find_allied_units()).
-    Always verify with get_game_state() first. If the unit cannot build the
-    requested structure, this call will return an error listing valid names.
+    'buildOptions' list. Call get_unit_details([unit_id]) to inspect a
+    builder's options if unsure. This call validates automatically and will
+    return an error listing valid names if build_type is wrong.
 
     This single call guarantees the reservation is in place before the build
     order reaches the game, preventing the native AI from overriding it.
@@ -893,26 +1068,6 @@ def gift_units(unit_ids: list) -> str:
         return json.dumps(resp)
     except (ConnectionError, RuntimeError) as e:
         print(f"[gift] ERROR: {e}")
-        return f"ERROR: {e}"
-
-
-@tool
-def get_pending_events() -> str:
-    """
-    Poll and drain all pending unit events (idle, finished, destroyed,
-    from_factory) that have been queued by the relay gadget since the last call.
-
-    Returns a JSON list of event objects:
-      {"type": "idle"|"finished"|"destroyed"|"from_factory",
-       "unitID": <n>, "taskID": "<str>", "frame": <n>,
-       "newUnitID": <n>   (only for from_factory events)}
-
-    Returns an empty list if no events are pending.
-    """
-    try:
-        evts = _get("/events")
-        return json.dumps(evts)
-    except ConnectionError as e:
         return f"ERROR: {e}"
 
 
@@ -1177,12 +1332,43 @@ Game basics:
 - Constructors (con) can build structures anywhere on the map.
 - Each game frame = 1/30 second. A frame value of 9000 ≈ 5 minutes in.
 
+Unit data schema — fields you will see in tool responses:
+- unitID   : integer — the LIVE instance ID. Use this in all commands (command_unit,
+             reserve_units, watch_unit, etc.). Unique per game session.
+- name     : string — the unit TYPE defName (e.g. 'armcom', 'armbeaver', 'armmex').
+             This is also what you pass as unit_type in build orders.
+- defID    : integer — internal engine type index. You will never need to pass this
+             to any tool; ignore it.
+- isCommander / isFactory / isBuilder / canMove / canAttack / isExtractor / isGenerator:
+             boolean flags describing the unit's role and capabilities.
+- health / maxHealth : current and maximum hit-points.
+- x, y, z  : world-space position. x = east-west, z = north-south, y = altitude.
+             Build orders use x and z only (y is terrain height, auto-calculated).
+- buildOptions : list of defNames this unit is allowed to build. Only present on
+             builders and factories. ALWAYS pick a name from this list when issuing
+             a build order — using any other name will silently fail or error.
+- teamID   : which team owns this unit.
+- isBot / isMyTeam : whether the owning team is the AI or the human player.
+
 Your role:
 - You watch in-game chat and respond when a player addresses you with
   "@agent" or starts a message with "!".
 - You can read the game state, issue unit orders, queue factory production,
   send chat replies, and coordinate multi-unit actions.
-- Always call get_game_state before taking any action so you have up-to-date info.
+MANDATORY state-awareness rules — follow these on EVERY invocation:
+1. ALWAYS call get_game_frame() first, before anything else.
+2. If no get_game_state() result exists in your conversation history, call
+   get_game_state() immediately ("summary" mode is cheapest).
+3. If the frame returned by get_game_frame() is more than 300 frames ahead
+   of the frame in your last get_game_state() response (~10 s), your cached
+   state is STALE — call get_game_state() before answering or issuing orders.
+4. If the player is asking for information about the game (resources, units,
+   map, enemies, etc.), ALWAYS call get_game_state() regardless of staleness.
+5. If you are about to issue a command (build, attack, move…), ALWAYS call
+   get_game_state() first if your state is stale (rule 3) OR if you do not
+   already have the relevant unit IDs in your context.
+6. Use get_game_state("units") only when you need positions/IDs across teams.
+   Prefer find_allied_units() to locate specific bot units to command.
 - ALWAYS use send_chat_message() to communicate with the player. It is the ONLY
   way your messages appear in-game. Your text response is NOT shown to the player.
 - Use map_ping(x, z, label) to highlight important locations on the map — threats,
@@ -1245,24 +1431,32 @@ Multi-step tasks with unit reservation:
 """
 
 BAR_TOOLS = [
-    get_game_state,
-    get_build_catalog,
-    get_new_chat_messages,
-    send_chat_message,
-    command_unit,
-    command_units_batch,
-    find_allied_units,
-    get_enemy_intel,
-    reserve_units,
-    unreserve_units,
-    watch_unit,
-    unwatch_unit,
-    get_pending_events,
-    reserve_and_build,
-    map_ping,
-    gift_units,
-    get_build_queue,
+    # ── State queries ──────────────────────────────────────────────────────
+    get_game_frame,       # current frame only — mandatory staleness check
+    get_game_state,       # quick summary / slim unit list / full unit list
+    get_build_catalog,    # all unit defs grouped by category
+    find_allied_units,    # category-filtered allied unit search
+    get_unit_details,     # full data (incl. buildOptions) for specific unit IDs
+    get_enemy_intel,      # visible enemies only (token-efficient subset of state)
+    get_build_queue,      # pending orders for factories / constructors
+    # ── Communication ──────────────────────────────────────────────────────
+    send_chat_message,    # broadcast in-game + TTS — ONLY way to talk to the player
+    map_ping,             # place a visible map marker
+    # ── Unit commands ──────────────────────────────────────────────────────
+    command_unit,         # single order (move/attack/patrol/fight/stop/reclaim/repair/guard/set_rally)
+    command_units_batch,  # convenience wrapper: multiple command_unit calls in one tool call
+    # ── Reservation & event watching ───────────────────────────────────────
+    reserve_units,        # lock unit(s) so native AI cannot override
+    unreserve_units,      # release lock when task is done or failed
+    watch_unit,           # register event listener (idle/finished/from_factory/destroyed)
+    unwatch_unit,         # cancel a previously registered watch
+    reserve_and_build,    # atomic: reserve + build order + watch idle (preferred for builds)
+    # ── Unit transfer ──────────────────────────────────────────────────────
+    gift_units,           # transfer bot-owned units to the human player
 ]
+# NOTE: get_new_chat_messages is intentionally excluded from BAR_TOOLS.
+# The agent loop (run_chat_loop) already routes chat messages to the LLM as
+# new invocations — the LLM must never poll it directly.
 
 
 def build_agent() -> Agent:
