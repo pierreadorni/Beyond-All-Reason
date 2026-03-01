@@ -146,44 +146,14 @@ function widget:DrawScreen()
 	local x2    = x1 + PORTRAIT_W
 	local y2    = y1 + PORTRAIT_H
 
-	gl.Blending(true)
+	gl.Blending(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
 
-	-- ── Drop shadow ────────────────────────────────────────────────────────
-	local shadowOff = 4
-	gl.Color(0.0, 0.0, 0.0, alpha * 0.5)
-	gl.Rect(x1 + shadowOff, y1 - shadowOff, x2 + shadowOff, y2 - shadowOff)
-
-	-- ── Background panel ───────────────────────────────────────────────────
-	gl.Color(0.05, 0.08, 0.10, alpha * 0.80)
-	gl.Rect(x1, y1, x2, y2)
-
-	-- ── Portrait sprite ────────────────────────────────────────────────────
+	-- ── Portrait sprite (no background — PNG transparency is preserved) ────
 	local tex = (pose == "attack") and TEX_ATTACK or TEX_CALM
 	gl.Color(1.0, 1.0, 1.0, alpha)
 	gl.Texture(tex)
 	gl.TexRect(x1, y1, x2, y2)
 	gl.Texture(false)
-
-	-- ── Border (pulsing accent when active, dim when fading out) ──────────
-	local borderAlpha
-	if active then
-		local t = Spring.GetGameSeconds and Spring.GetGameSeconds() or 0
-		borderAlpha = alpha * (0.65 + 0.35 * math.abs(math.sin(t * math.pi)))
-		if pose == "attack" then
-			-- Red/orange pulse for aggressive stance
-			gl.Color(1.00, 0.35, 0.10, borderAlpha)
-		else
-			-- Green pulse for calm stance
-			gl.Color(0.40, 0.90, 0.50, borderAlpha)
-		end
-	else
-		gl.Color(0.30, 0.30, 0.30, alpha * 0.60)
-	end
-	local b = 2  -- border thickness
-	gl.Rect(x1,     y2 - b, x2,     y2    )  -- top
-	gl.Rect(x1,     y1,     x2,     y1 + b)  -- bottom
-	gl.Rect(x1,     y1,     x1 + b, y2    )  -- left
-	gl.Rect(x2 - b, y1,     x2,     y2    )  -- right
 
 	-- ── Label ──────────────────────────────────────────────────────────────
 	if alpha > 0.3 then
