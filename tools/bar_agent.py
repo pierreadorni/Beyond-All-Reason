@@ -28,14 +28,18 @@ Requirements
     pip install elevenlabs sounddevice numpy   # optional, for TTS
 """
 
+import asyncio
 import json
 import os
+import queue as _queue
+import subprocess
 import sys
 import time
 import threading
 import urllib.request
 import urllib.error
-from typing import Optional
+from pathlib import Path
+from typing import Optional, AsyncIterator
 
 # ---------------------------------------------------------------------------
 # Strands / Mistral imports
@@ -59,11 +63,61 @@ AGENT_PREFIX = os.environ.get("AGENT_PREFIX", "@agent")
 AGENT_PREFIX2 = os.environ.get("AGENT_PREFIX2", "!")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # seconds
 
+# ---------------------------------------------------------------------------
+# STT / Voxtral configuration
+# ---------------------------------------------------------------------------
+# IPC files: default to the Spring write-data LuaUI/ folder
+# (tools/ → BAR.sdd/ → games/ → data/ → LuaUI/)
+_SCRIPT_DIR  = Path(__file__).parent
+_IPC_DIR     = Path(os.environ.get("STT_IPC_DIR",
+                    str(_SCRIPT_DIR.parent.parent.parent / "LuaUI")))
+_IPC_DIR.mkdir(parents=True, exist_ok=True)
+STT_TRIGGER_FILE = _IPC_DIR / "stt_trigger.flag"
+STT_STOP_FILE    = _IPC_DIR / "stt_stop.flag"
+STT_CANCEL_FILE  = _IPC_DIR / "stt_cancel.flag"
+STT_DONE_FILE    = _IPC_DIR / "stt_done.flag"
+STT_RESULT_FILE  = _IPC_DIR / "stt_result.txt"  # written for Lua HUD display
+
+STT_SAMPLE_RATE = 16000
+STT_CHANNELS    = 1
+STT_BLOCK_SIZE  = 4096
+STT_CHUNK_SIZE  = STT_BLOCK_SIZE * 2  # bytes (int16)
+STT_MODEL       = "voxtral-mini-transcribe-realtime-2602"
+
+# Check for sounddevice input/output (both may be unavailable in WSL)
+_sd_output_available = False  # updated below and again inside ElevenLabs block
+try:
+    import sounddevice as _sd
+    _sd_available = _sd.query_devices(kind="input") is not None
+    try:
+        _sd_output_available = _sd.query_devices(kind="output") is not None
+    except Exception:
+        _sd_output_available = False
+except Exception:
+    _sd = None
+    _sd_available = False
+    _sd_output_available = False
+
 # ElevenLabs TTS (all optional — TTS silently disabled when unset/missing)
 EL_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 EL_VOICE_ID = os.environ.get("EL_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
 EL_MODEL_ID = os.environ.get("EL_MODEL_ID", "eleven_turbo_v2_5")
 EL_AMP_SCALE = float(os.environ.get("EL_AMP_SCALE", "5.0"))  # RMS → 0–1
+# Fallback TTS player when sounddevice output is unavailable (e.g. WSL).
+# Raw PCM s16le 16 kHz mono is written to its stdin.
+TTS_PLAYER_CMD = os.environ.get(
+    "TTS_PLAYER_CMD",
+    "ffplay.exe -f s16le -ar 16000 -nodisp -autoexit -",
+)
+# Optional: index or substring of the output device name for sounddevice.
+# Leave unset to use the system default output device.
+# List devices: python -c "import sounddevice; print(sounddevice.query_devices())"
+SD_OUTPUT_DEVICE: "int | str | None" = os.environ.get("SD_OUTPUT_DEVICE") or None
+try:
+    if SD_OUTPUT_DEVICE is not None:
+        SD_OUTPUT_DEVICE = int(SD_OUTPUT_DEVICE)  # type: ignore[assignment]
+except ValueError:
+    pass  # keep as string (name substring)
 
 # ---------------------------------------------------------------------------
 # ElevenLabs TTS engine  (optional)
@@ -76,9 +130,17 @@ try:
     import numpy as _np
     import sounddevice as _sd
 
+    # Re-check output availability now that numpy/_sd are imported for TTS use
+    try:
+        _sd.query_devices(kind="output")
+        _sd_output_available = True
+    except Exception:
+        _sd_output_available = False
+
     if EL_API_KEY:
         _el_client = _ElevenLabs(api_key=EL_API_KEY)
-        print(f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}")
+        _out_mode = "sounddevice" if _sd_output_available else f"pipe→ {TTS_PLAYER_CMD.split()[0]}"
+        print(f"[tts] ElevenLabs ready  voice={EL_VOICE_ID}  model={EL_MODEL_ID}  output={_out_mode}")
     else:
         print("[tts] ELEVENLABS_API_KEY not set — TTS disabled.")
 except ImportError as _tts_import_err:
@@ -112,9 +174,9 @@ def _speak(text: str, pose: str = "calm") -> None:
         audio_bytes: bytes = (
             raw if isinstance(raw, (bytes, bytearray)) else b"".join(raw)
         )
-        audio_f32 = (
-            _np.frombuffer(audio_bytes, dtype=_np.int16).astype(_np.float32) / 32768.0
-        )
+        # Keep int16 for direct piping; derive float32 for sounddevice + amplitude
+        audio_i16 = _np.frombuffer(audio_bytes, dtype=_np.int16)
+        audio_f32 = audio_i16.astype(_np.float32) / 32768.0
         duration = len(audio_f32) / 16000.0
 
         # Notify the game: show the portrait with the requested pose
@@ -126,21 +188,47 @@ def _speak(text: str, pose: str = "calm") -> None:
         SAMPLE_RATE = 16000
         CHUNK = int(SAMPLE_RATE * 0.05)  # 800 samples = 50 ms blocks
 
-        with _sd.OutputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32"
-        ) as stream:
-            for i in range(0, len(audio_f32), CHUNK):
-                chunk = audio_f32[i : i + CHUNK]
-                if len(chunk) < CHUNK:
-                    # Pad the final (possibly short) block so OutputStream is happy
-                    chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
-                stream.write(chunk)
-                rms = float(_np.sqrt(_np.mean(chunk**2)))
-                amplitude = min(1.0, rms * EL_AMP_SCALE)
+        if _sd_output_available:
+            # Native path — works on most laptops / desktops
+            with _sd.OutputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                device=SD_OUTPUT_DEVICE,
+            ) as stream:
+                for i in range(0, len(audio_f32), CHUNK):
+                    chunk = audio_f32[i : i + CHUNK]
+                    if len(chunk) < CHUNK:
+                        chunk = _np.pad(chunk, (0, CHUNK - len(chunk)))
+                    stream.write(chunk)
+                    rms = float(_np.sqrt(_np.mean(chunk**2)))
+                    amplitude = min(1.0, rms * EL_AMP_SCALE)
+                    try:
+                        _post("/tts/amplitude", {"value": amplitude})
+                    except Exception:
+                        pass
+        else:
+            # WSL / no-output-device fallback: pipe raw s16le PCM to ffplay.exe
+            cmd = TTS_PLAYER_CMD.split()
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            try:
+                for i in range(0, len(audio_i16), CHUNK):
+                    chunk_i16 = audio_i16[i : i + CHUNK]
+                    if len(chunk_i16) < CHUNK:
+                        chunk_i16 = _np.pad(chunk_i16, (0, CHUNK - len(chunk_i16)))
+                    proc.stdin.write(chunk_i16.tobytes())
+                    # Amplitude for the portrait animation (same chunk)
+                    chunk_f = chunk_i16.astype(_np.float32) / 32768.0
+                    rms = float(_np.sqrt(_np.mean(chunk_f**2)))
+                    amplitude = min(1.0, rms * EL_AMP_SCALE)
+                    try:
+                        _post("/tts/amplitude", {"value": amplitude})
+                    except Exception:
+                        pass
+            finally:
                 try:
-                    _post("/tts/amplitude", {"value": amplitude})
+                    proc.stdin.close()
                 except Exception:
                     pass
+                proc.wait()
 
     except Exception as exc:
         print(f"[tts] ERROR: {exc}")
@@ -831,12 +919,245 @@ def get_pending_events() -> str:
 # ---------------------------------------------------------------------------
 # Active-task registry  (task_id → context for event-driven continuation)
 # ---------------------------------------------------------------------------
-# Structure:  activeTasks[task_id] = {
-#   "original_request":  str,   # user message that started the task
-#   "reserved_units":    list,  # unit IDs currently reserved
-#   "steps_done":        list,  # short descriptions of completed steps
-# }
 activeTasks: dict = {}
+
+# ---------------------------------------------------------------------------
+# Module-level work queue  (shared by chat-loop thread AND STT callback)
+# ---------------------------------------------------------------------------
+_work_queue:   _queue.PriorityQueue = _queue.PriorityQueue()
+_seq_counter:  int = 0
+_seq_lock:     threading.Lock = threading.Lock()
+_queued_tasks: set = set()
+_queued_lock:  threading.Lock = threading.Lock()
+
+
+def _next_seq() -> int:
+    global _seq_counter
+    with _seq_lock:
+        _seq_counter += 1
+        return _seq_counter
+
+
+def _enqueue(inp: str, task_id: "str | None", priority: int) -> None:
+    """Thread-safe enqueue for agent work items."""
+    if task_id:
+        with _queued_lock:
+            if task_id in _queued_tasks:
+                print(f"[skip] task {task_id!r} already queued")
+                return
+            _queued_tasks.add(task_id)
+    _work_queue.put((priority, _next_seq(), inp, task_id))
+    print(f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}")
+
+
+# ---------------------------------------------------------------------------
+# STT coroutines  (Voxtral real-time transcription, merged from SpeechToTextDaemon)
+# ---------------------------------------------------------------------------
+_stt_audio_q: asyncio.Queue   # filled by audio_reader, consumed by gated_audio_stream
+_stt_start:   asyncio.Event   # key pressed
+_stt_stop:    asyncio.Event   # key released
+_stt_cancel:  asyncio.Event   # key cancelled
+
+
+async def _stt_mic_stream() -> AsyncIterator[bytes]:
+    """Capture PCM s16le from the default mic via sounddevice."""
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue[bytes] = asyncio.Queue()
+
+    def _cb(indata, frames, time_info, status):
+        loop.call_soon_threadsafe(q.put_nowait, bytes(indata))
+
+    with _sd.InputStream(
+        samplerate=STT_SAMPLE_RATE, channels=STT_CHANNELS,
+        dtype="int16", blocksize=STT_BLOCK_SIZE, callback=_cb,
+    ):
+        print("[stt] Microphone open via sounddevice.")
+        while True:
+            yield await q.get()
+
+
+async def _stt_stdin_stream() -> AsyncIterator[bytes]:
+    """Read raw PCM s16le chunks from stdin (piped from ffmpeg)."""
+    loop = asyncio.get_event_loop()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
+    print("[stt] Reading audio from stdin (ffmpeg pipe).")
+    while True:
+        chunk = await reader.read(STT_CHUNK_SIZE)
+        if not chunk:
+            break
+        yield chunk
+
+
+async def _stt_audio_reader() -> None:
+    """Background task: pump mic/stdin into _stt_audio_q."""
+    source = _stt_mic_stream() if _sd_available else _stt_stdin_stream()
+    print("[stt] Audio reader started.")
+    async for chunk in source:
+        await _stt_audio_q.put(chunk)
+    await _stt_audio_q.put(None)
+    print("[stt] Audio reader finished (EOF).")
+
+
+async def _stt_gated_stream() -> AsyncIterator[bytes]:
+    """Yield audio only while the push-to-talk key is held."""
+    await _stt_start.wait()
+    _stt_start.clear()
+
+    # Discard stale chunks
+    drained = 0
+    while not _stt_audio_q.empty():
+        try: _stt_audio_q.get_nowait(); drained += 1
+        except asyncio.QueueEmpty: break
+    if drained:
+        print(f"[stt] Drained {drained} stale audio chunk(s).")
+
+    print("[stt] Recording — streaming to Voxtral.")
+    while True:
+        try:
+            chunk = await asyncio.wait_for(_stt_audio_q.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            if _stt_cancel.is_set():
+                _stt_cancel.clear()
+                return
+            continue
+        if chunk is None:
+            return
+        if _stt_stop.is_set():
+            _stt_stop.clear()
+            yield chunk
+            while not _stt_audio_q.empty():
+                try: _stt_audio_q.get_nowait()
+                except asyncio.QueueEmpty: break
+            return
+        if _stt_cancel.is_set():
+            _stt_cancel.clear()
+            while not _stt_audio_q.empty():
+                try: _stt_audio_q.get_nowait()
+                except asyncio.QueueEmpty: break
+            print("[stt] Cancelled.")
+            return
+        yield chunk
+
+
+async def _stt_session_loop() -> None:
+    """
+    Maintain a warm Voxtral WebSocket. When key is pressed, stream audio;
+    on completion, enqueue the transcription directly into the agent queue
+    (bypassing game chat entirely).
+    """
+    try:
+        from mistralai import Mistral as _Mistral
+        from mistralai.extra.realtime import UnknownRealtimeEvent as _URE
+        from mistralai.models import (
+            AudioFormat as _AF,
+            RealtimeTranscriptionError as _RTE,
+            RealtimeTranscriptionSessionCreated as _RTSC,
+            TranscriptionStreamDone as _TSD,
+            TranscriptionStreamTextDelta as _TSTD,
+        )
+    except ImportError:
+        print("[stt] mistralai not installed — STT disabled. pip install mistralai")
+        return
+
+    api_key = os.environ.get("MISTRAL_API_KEY", "")
+    if not api_key:
+        print("[stt] MISTRAL_API_KEY not set — STT disabled.")
+        return
+
+    _mc = _Mistral(api_key=api_key)
+    _af = _AF(encoding="pcm_s16le", sample_rate=STT_SAMPLE_RATE)
+    print("[stt] Session loop started — pre-connecting WebSocket.")
+
+    while True:
+        text_parts: list[str] = []
+        aborted = False
+        try:
+            async for event in _mc.audio.realtime.transcribe_stream(
+                audio_stream=_stt_gated_stream(),
+                model=STT_MODEL,
+                audio_format=_af,
+            ):
+                if isinstance(event, _RTSC):
+                    print("[stt] WebSocket warm — waiting for key press.")
+                elif isinstance(event, _TSTD):
+                    text_parts.append(event.text)
+                    print(event.text, end="", flush=True)
+                elif isinstance(event, _TSD):
+                    print("\n[stt] Transcription complete.")
+                elif isinstance(event, _RTE):
+                    print(f"[stt] Transcription error: {event}")
+                    aborted = True
+        except Exception as exc:
+            print(f"[stt] WebSocket error: {exc}")
+            aborted = True
+            await asyncio.sleep(1.0)
+
+        if not aborted:
+            text = "".join(text_parts).strip()
+            if text:
+                # Write result for Lua widget HUD display (no chat send needed)
+                STT_RESULT_FILE.write_text(text, encoding="utf-8")
+                print(f"[stt] Routing to agent: {text!r}")
+                # Directly enqueue — no game-chat round-trip
+                _enqueue(f"[Voice] {text}", task_id=None, priority=0)
+            else:
+                print("[stt] Empty transcription.")
+            # Write done flag so Lua widget resets its UI to idle
+            STT_DONE_FILE.write_text("done", encoding="utf-8")
+
+        await asyncio.sleep(0.1)
+
+
+async def _stt_trigger_loop() -> None:
+    """Poll IPC flag files at 50 ms to detect key press/release."""
+    print(f"[stt] Trigger loop started (IPC dir: {_IPC_DIR})")
+    while True:
+        await asyncio.sleep(0.05)
+        if STT_CANCEL_FILE.exists():
+            STT_CANCEL_FILE.unlink(missing_ok=True)
+            _stt_cancel.set()
+        if STT_STOP_FILE.exists():
+            STT_STOP_FILE.unlink(missing_ok=True)
+            _stt_stop.set()
+            print("[stt] Stop flag — key released.")
+        if STT_TRIGGER_FILE.exists():
+            STT_TRIGGER_FILE.unlink(missing_ok=True)
+            STT_DONE_FILE.unlink(missing_ok=True)
+            STT_RESULT_FILE.unlink(missing_ok=True)
+            _stt_start.set()
+            print("[stt] Trigger flag — key pressed.")
+
+
+def _run_stt_loop() -> None:
+    """Entry point for the STT daemon thread."""
+    global _stt_audio_q, _stt_start, _stt_stop, _stt_cancel
+
+    # Clean stale flag files from previous runs
+    for f in [STT_TRIGGER_FILE, STT_STOP_FILE, STT_CANCEL_FILE,
+              STT_DONE_FILE, STT_RESULT_FILE]:
+        f.unlink(missing_ok=True)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _stt_audio_q = asyncio.Queue()
+    _stt_start   = asyncio.Event()
+    _stt_stop    = asyncio.Event()
+    _stt_cancel  = asyncio.Event()
+
+    print(f"[stt] STT thread started. IPC dir: {_IPC_DIR}")
+    print(f"[stt] Mic mode: {'sounddevice' if _sd_available else 'stdin (ffmpeg pipe)'}")
+    try:
+        loop.run_until_complete(asyncio.gather(
+            _stt_audio_reader(),
+            _stt_session_loop(),
+            _stt_trigger_loop(),
+        ))
+    except Exception as exc:
+        print(f"[stt] Fatal error in STT loop: {exc}")
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1017,43 +1338,14 @@ def run_chat_loop(agent: Agent) -> None:
     Main loop: poll /chat every POLL_INTERVAL seconds.
     Also polls /events and re-invokes the LLM for any active watched tasks.
 
-    A single worker thread consumes a PriorityQueue so Strands is never called
-    concurrently.  Priority 0 = human input (highest), 1 = task continuation.
+    A single worker thread consumes the module-level _work_queue so Strands is
+    never called concurrently.  Priority 0 = chat/voice input, 1 = task continuation.
     """
     print(
         f"AgentBridge chat loop started (polling {BASE_URL}/chat every {POLL_INTERVAL}s)"
     )
     print(f"Trigger prefixes: '{AGENT_PREFIX}'  '{AGENT_PREFIX2}'")
     print("Press Ctrl-C to stop.\n")
-
-    import queue as _queue
-
-    # (priority, sequence, inp, task_id)
-    # sequence breaks ties to preserve FIFO within the same priority.
-    _work_queue: _queue.PriorityQueue = _queue.PriorityQueue()
-    _seq = 0
-    _seq_lock = threading.Lock()
-    # task_ids already in the queue (not yet processed) — avoids duplicates
-    _queued_tasks: set = set()
-    _queued_lock = threading.Lock()
-
-    def _next_seq() -> int:
-        nonlocal _seq
-        with _seq_lock:
-            _seq += 1
-            return _seq
-
-    def _enqueue(inp: str, task_id: str | None, priority: int) -> None:
-        if task_id:
-            with _queued_lock:
-                if task_id in _queued_tasks:
-                    print(f"[skip] task {task_id!r} already queued")
-                    return
-                _queued_tasks.add(task_id)
-        _work_queue.put((priority, _next_seq(), inp, task_id))
-        print(
-            f"[queue] enqueued priority={priority} task={task_id!r} len={_work_queue.qsize()}"
-        )
 
     def _worker() -> None:
         while True:
@@ -1091,7 +1383,7 @@ def run_chat_loop(agent: Agent) -> None:
                 if task_id:
                     with _queued_lock:
                         _queued_tasks.discard(task_id)
-                _work_queue.task_done()
+                _work_queue.task_done()  # type: ignore[attr-defined]
 
     # Start the single worker thread
     threading.Thread(target=_worker, daemon=True, name="agent-worker").start()
@@ -1170,6 +1462,14 @@ def run_chat_loop(agent: Agent) -> None:
 
 def main() -> None:
     agent = build_agent()
+
+    # Start the STT daemon thread (voice → Voxtral → agent queue, no chat hop)
+    stt_thread = threading.Thread(
+        target=_run_stt_loop, daemon=True, name="stt-daemon"
+    )
+    stt_thread.start()
+    print("[main] STT daemon thread started.")
+
     try:
         run_chat_loop(agent)
     except KeyboardInterrupt:
