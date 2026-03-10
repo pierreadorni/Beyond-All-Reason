@@ -49,3 +49,4 @@ uv run python ./tools/bar_agent.py
 
 ## Demo 
 
+[![Watch the demo](./doc/demo.png)](https://youtu.be/9jxDkhIGeKw)
